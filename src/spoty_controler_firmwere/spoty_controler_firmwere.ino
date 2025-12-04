@@ -1,4 +1,3 @@
-
 #include <base64.h>
 #include <ArduinoJson.h>
 #include <stdint.h>
@@ -8,23 +7,26 @@
 #include <ESP8266WiFi.h> 
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
+// HTTPS Server removed (standard HTTP is sufficient for this approach)
 #include <WiFiClientSecureBearSSL.h>
 #include <WiFiUdp.h>
 #include <NTPClient.h>
-#include <WiFiNINA.h>
-#include <Time.h>
+#include <time.h> 
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
 // WIFI credentials
-char WIFI_SSID[] = "CALCALZON_2.5G"
-char PASSWORD[] = "Ser211@TeleCentro"
+char WIFI_SSID[] = "CALCALZON_2.5G";
+char PASSWORD[] = "LaSolucion233@";
 
 // Spotify API credentials
 #define CLIENT_ID "7dbaacd4aa4d4f668e6782175ef4e4b4"
 #define CLIENT_SECRET "32ad905e011046e59976f91aaf5ba254"
-String REDIRECT_URI = "http://192.168.0.12/callback";
+
+// FIXED: Using Loopback address with port 8000 as requested.
+// This allows the ESP IP to change without breaking Spotify Auth.
+String REDIRECT_URI = "http://127.0.0.1:8000/callback";
 
 #define codeVersion "1.2.0"
 #define EEPROM_SIZE 4095
@@ -44,13 +46,7 @@ uint8_t endL[8] = {0x00,0x02,0x0A,0x1E,0x0A,0x02,0x00,0x00};
 uint8_t point[8] = {0x00,0x00,0x0E,0x1F,0x0E,0x00,0x00,0x00};
 uint8_t starter[8] = {0x00,0x08,0x08,0x0F,0x08,0x08,0x00,0x00};
 
-IPAddress local_IP(192, 168, 1, 180);
-// Set your Gateway IP address
-IPAddress gateway(192, 168, 1, 1);
-
-IPAddress subnet(255, 255, 0, 0);
-IPAddress primaryDNS(8, 8, 8, 8);   //optional
-IPAddress secondaryDNS(8, 8, 4, 4); //optional
+// REMOVED: Static IP configuration. Now uses DHCP.
   
 LiquidCrystal_I2C lcd(0x3F,20,4);  
 
@@ -64,8 +60,6 @@ String getValue(HTTPClient &http, String key) {
   WiFiClient * stream = http.getStreamPtr();
   while (http.connected() && (len > 0 || len == -1)) {
     size_t size = stream->available();
-    // Serial.print("Size: ");
-    // Serial.println(size);
     if (size) {
       int c = stream->readBytes(char_buff, ((size > sizeof(char_buff)) ? sizeof(char_buff) : size));
       if (found) {
@@ -81,9 +75,6 @@ String getValue(HTTPClient &http, String key) {
         }else{
             break;
         }
-          
-        // Serial.print("get: ");
-        // Serial.println(get);
       }
       else if ((!look) && (char_buff[0] == key[0])) {
         look = true;
@@ -97,10 +88,8 @@ String getValue(HTTPClient &http, String key) {
       }
     }
   }
-//   Serial.println(*(ret_str.end()));
-//   Serial.println(*(ret_str.end()-1));
-//   Serial.println(*(ret_str.end()-2));
-  if(*(ret_str.end()-1) == ','){
+
+  if(ret_str.length() > 0 && *(ret_str.end()-1) == ','){
     ret_str = ret_str.substring(0,ret_str.length()-1);
   }
   return ret_str;
@@ -125,22 +114,15 @@ struct songDetails{
 //Create spotify connection class
 class SpotConn {
 public:
-	SpotConn(){
+    SpotConn(){
         client = std::make_unique<BearSSL::WiFiClientSecure>();
-        client->setInsecure();
+        client->setInsecure(); // Secure Client for OUTGOING requests to Spotify
+        // FIXED: Increased buffer size to fix error -5 (Connection Lost) during handshake
+        // RX needs to be larger to receive the TLS certificate chain
+        client->setBufferSizes(4096, 1024);
     }
-    // httpResponse makeSpotifyRequest(const char* URI, const char** headers, int numHeaders, const char* RequestBody){
-    //     https.begin(*client,URI);
-    //     for(;numHeaders>0;numHeaders--,headers += 2){
-    //         https.addHeader(*headers,*(headers+1));
-    //     }
-    //     struct httpResponse res;
-    //     res.responseCode = https.POST(RequestBody);
-    //     res.responseMessage = https.getString()
-    //     https.end();
-    //     return res;
-    // }
-	bool getUserCode(String serverCode) {
+    
+    bool getUserCode(String serverCode) {
         https.begin(*client,"https://accounts.spotify.com/api/token");
         String auth = "Basic " + base64::encode(String(CLIENT_ID) + ":" + String(CLIENT_SECRET));
         https.addHeader("Authorization",auth);
@@ -235,13 +217,9 @@ public:
         bool refresh = false;
         // Check if the request was successful
         if (httpResponseCode == 200) {
-                        // 
-
+                        
             String currentSongProgress = getValue(https,"progress_ms");
             currentSongPositionMs = currentSongProgress.toFloat();
-            
-            // Serial.println(imageLink);
-            
             
             String albumName = getValue(https,"name");
             String artistName = getValue(https,"name");
@@ -252,26 +230,24 @@ public:
             String isPlay = getValue(https, "is_playing");
             isPlaying = isPlay == "true";
             Serial.println(isPlay);
-            // Serial.println(songId);
-            songId = songId.substring(15,songId.length()-1);
-            // Serial.println(songId);
-            https.end();
-            // listSPIFFS();
             
-            currentSong.album = albumName.substring(1,albumName.length()-1);
-            currentSong.artist = artistName.substring(1,artistName.length()-1);
-            currentSong.song = songName.substring(1,songName.length()-1);
+            if (songId.length() > 15) {
+               songId = songId.substring(15,songId.length()-1); // Basic check to avoid crash
+            }
+            
+            https.end();
+            
+            if (albumName.length() > 2) currentSong.album = albumName.substring(1,albumName.length()-1);
+            if (artistName.length() > 2) currentSong.artist = artistName.substring(1,artistName.length()-1);
+            if (songName.length() > 2) currentSong.song = songName.substring(1,songName.length()-1);
             currentSong.Id = songId;
             currentSong.isLiked = findLikedStatus(songId);
             success = true;
         } else {
             Serial.print("Error getting track info: ");
             Serial.println(httpResponseCode);
-            // String response = https.getString();
-            // Serial.println(response);
             https.end();
         }
-        
         
         // Disconnect from the Spotify API
         if(success){
@@ -300,9 +276,6 @@ public:
             https.end();
         }
 
-        
-        // Disconnect from the Spotify API
-        
         return success;
     }
     bool toggleLiked(String songId){
@@ -334,9 +307,6 @@ public:
             https.end();
         }
 
-        
-        // Disconnect from the Spotify API
-        
         return success;
     }
     bool adjustVolume(int vol){
@@ -348,7 +318,6 @@ public:
         bool success = false;
         // Check if the request was successful
         if (httpResponseCode == 204) {
-            // String response = https.getString();
             currVol = vol;
             success = true;
         }else if(httpResponseCode == 403){
@@ -365,7 +334,6 @@ public:
             Serial.println(response);
         }
 
-        
         // Disconnect from the Spotify API
         https.end();
         return success;
@@ -379,7 +347,6 @@ public:
         bool success = false;
         // Check if the request was successful
         if (httpResponseCode == 204) {
-            // String response = https.getString();
             Serial.println("skipping forward");
             success = true;
         } else {
@@ -389,7 +356,6 @@ public:
             Serial.println(response);
         }
 
-        
         // Disconnect from the Spotify API
         https.end();
         getTrackInfo();
@@ -404,7 +370,6 @@ public:
         bool success = false;
         // Check if the request was successful
         if (httpResponseCode == 204) {
-            // String response = https.getString();
             Serial.println("skipping backward");
             success = true;
         } else {
@@ -414,7 +379,6 @@ public:
             Serial.println(response);
         }
 
-        
         // Disconnect from the Spotify API
         https.end();
         getTrackInfo();
@@ -431,7 +395,6 @@ public:
         bool success = false;
         // Check if the request was successful
         if (httpResponseCode == 200) {
-            // String response = https.getString();
             Serial.println("added track to liked songs");
             success = true;
         } else {
@@ -441,7 +404,6 @@ public:
             Serial.println(response);
         }
 
-        
         // Disconnect from the Spotify API
         https.end();
         return success;
@@ -451,13 +413,10 @@ public:
         https.begin(*client,url);
         String auth = "Bearer " + String(accessToken);
         https.addHeader("Authorization",auth);
-        // https.addHeader("Content-Type","application/json");
-        // char requestBody[] = "{\"ids\":[\"string\"]}";
         int httpResponseCode = https.DELETE();
         bool success = false;
         // Check if the request was successful
         if (httpResponseCode == 200) {
-            // String response = https.getString();
             Serial.println("removed liked songs");
             success = true;
         } else {
@@ -467,7 +426,6 @@ public:
             Serial.println(response);
         }
 
-        
         // Disconnect from the Spotify API
         https.end();
         return success;
@@ -490,7 +448,9 @@ public:
 
 
 WiFiUDP ntpUDP;
-ESP8266WebServer server(80); //Server on port 80
+// FIXED: Reverted to Standard Web Server (Port 80)
+ESP8266WebServer server(80);
+
 SpotConn spotifyConnection;
 NTPClient timeClient(ntpUDP, "ar.pool.ntp.org", -10800, 60000); // NTP client
 
@@ -511,6 +471,9 @@ String printEncryptionType(int thisType) {
       break;
     case ENC_TYPE_AUTO:
       return("Auto");
+      break;
+    default:
+      return "Unknown";
       break;
   }
 }
@@ -539,11 +502,11 @@ public:
     lcd.setCursor(0, 0);
     lcd.print("Spotify Setup");
     lcd.setCursor(0, 1);
-    lcd.print("go to:");
+    lcd.print("Connect to IP:");
     lcd.setCursor(0, 2);
-    lcd.print("http://" + WiFi.localIP().toString() + "/"); // shows the URI you need to connect to to auth
+    lcd.print(WiFi.localIP()); 
     lcd.setCursor(0, 3);
-    lcd.print("To sync to spotify");
+    lcd.print("For setup");
   }
 
   void waitForDevice(){ // draws the waiting for device page
@@ -557,27 +520,27 @@ public:
 
 
   void showNets(int numNets, int selected){ // it shows all networks
-    
-    String IDs[numNets] = [];
-    for(int i = 0; i < numNets; i++){
-        IDs[i] = WiFi.SSID(i)
-    }
-
-    Serial.println(IDs);
+    // Fixed: Cannot use String arrays dynamically like this in C++. 
+    // We access the WiFi struct directly.
     
     int showNum = int(selected/2);
-
-    if(numNets%2 != 0){
-        IDs[numNets+1] = "";
-    }
+    
+    // We don't need a local array IDs[], we just use WiFi.SSID(i)
 
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Networks - " + String(numNets)); // menu name and number of networks
     lcd.setCursor(0, 1);
-    lcd.print(String(((selected % 2) == 0)? "- " : "->") + IDs[showNum]); // shows first network
+    // Print first network
+    String id1 = WiFi.SSID(showNum);
+    lcd.print(String(((selected % 2) == 0)? "- " : "->") + id1); 
     lcd.setCursor(0, 2);
-    lcd.print(String(((selected % 2) != 0)? "- " : "->") + IDs[showNum+1]); //shows second network
+    // Print second network if available
+    if (showNum + 1 < numNets) {
+       String id2 = WiFi.SSID(showNum + 1);
+       lcd.print(String(((selected % 2) != 0)? "- " : "->") + id2); 
+    }
+    
     lcd.setCursor(0, 3);
     lcd.print("            < E > S"); // shows action bar
   }
@@ -587,34 +550,39 @@ public:
     lcd.setCursor(0, 0);
     lcd.print(WiFi.SSID(selected)); // Net name
     lcd.setCursor(0, 1);
-    String enc = printEncryptionType(WiFi.encryptionType(selected))
+    
+    int encType = WiFi.encryptionType(selected);
+    String enc = printEncryptionType(encType);
+    
     lcd.print("Encryption: " + enc); // encryption type
     lcd.setCursor(0, 2);
     // decision tree for action menu
-    switch (enc){
+    
+    // FIXED: C++ cannot switch on Strings. Switched to int/enum logic.
+    switch (encType){
 
-    case "None":
+    case ENC_TYPE_NONE:
         switch (mode){
         case 0:
             lcd.print("connect"); // connect
             break;
         case 1:
-            lcd.print("RSSI" + str(WiFi.RSSI()))
+            lcd.print("RSSI" + String(WiFi.RSSI(selected)));
             break;
         default:
             break;}
         break;
     
-    case "WEP":
+    case ENC_TYPE_WEP:
         switch (mode){
         case 0:
             lcd.print("connect"); // connect
             break;
         case 1:
-            lcd.print("RSSI" + str(WiFi.RSSI()));
+            lcd.print("RSSI" + String(WiFi.RSSI(selected)));
             break;
         case 2:
-            lcd.print("Key Index: " /*need to implement the actual wifi pass storage*/);
+            lcd.print("Key Index: ");
             break;
         case 3: 
             lcd.print("Password");
@@ -622,44 +590,49 @@ public:
         default:
             break;}
         break;
-    case "WPA":
+    case ENC_TYPE_TKIP: // WPA
         switch (mode){
         case 0:
             lcd.print("connect"); // connect
             break;
         case 1:
-            lcd.print("RSSI" + str(WiFi.RSSI()))
+             lcd.print("RSSI" + String(WiFi.RSSI(selected)));
             break;
         case 2:
             lcd.print("password");
             break;
         default:
             break;}
-    case "WPA2":
+        break; 
+    case ENC_TYPE_CCMP: // WPA2
         switch (mode){
         case 0:
             lcd.print("connect"); // connect
             break;
         case 1:
-            lcd.print("RSSI" + str(WiFi.RSSI())) // signal strength
+            lcd.print("RSSI" + String(WiFi.RSSI(selected))); // signal strength
             break;
         case 2:
             lcd.print("password"); 
+            break;
         default:
             break;}
+        break;    
             
-    case "auto":
+    case ENC_TYPE_AUTO:
         switch (mode){
         case 0:
             lcd.print("connect"); // connect
             break;
         case 1:
-            lcd.print("RSSI" + str(WiFi.RSSI())) // signal strength
+            lcd.print("RSSI" + String(WiFi.RSSI(selected))); // signal strength
             break;
         case 2:
             lcd.print("password"); 
+            break;
         default:
             break;}
+        break;
     default:
         break;
     }
@@ -673,11 +646,11 @@ public:
     lcd.print("- " + menuText);
     String writeLine = "";
     scrolable = (writenText.length() >= 18) ? true : false;
-    if scrolable{ // prepares the text to be shown 
+    if (scrolable){ // prepares the text to be shown 
         if (scrolable){
             writeLine = writenText.substring(selected-18, selected) + leter;
         } else if(writing){
-            writeLine = writenText.substring(0, selected) + leter + writenText.substring(selected+1, 20)
+            writeLine = writenText.substring(0, selected) + leter + writenText.substring(selected+1, 20);
         }
     }
     lcd.setCursor(0, 1);
@@ -703,8 +676,12 @@ public:
     lcd.clear();
     lcd.setCursor(15, 0);
     timeClient.update(); // shows the time
-    String ti = Str((hour() < 10)? "0"+Str(hour()) : hour())+":"+Str((minute() < 10)? "0"+Str(minute()) : minute())
-    lcd.print();
+    
+    // UPDATED: Used timeClient.getHours() instead of hour() from TimeLib
+    int h = timeClient.getHours();
+    int m = timeClient.getMinutes();
+    String ti = String((h < 10)? "0"+String(h) : String(h))+":"+String((m < 10)? "0"+String(m) : String(m));
+    lcd.print(ti);
 
     // shows song name
     lcd.setCursor(0,1);
@@ -786,31 +763,69 @@ bool serverOn = true;
 LCDmanager LCDm;
 
 //web pages
-// HTML for main root page
-const char mainPage[] PROGMEM = R"=====(
+// FIXED: HTML now split into PROGMEM chunks to avoid giant stack allocation or snprintf buffer overflows.
+// This is the "Chunked Send" method which is extremely memory efficient on ESP8266.
+
+const char mainPagePart1[] PROGMEM = R"=====(
 <HTML>
     <HEAD>
-        <TITLE>My first web page</TITLE>
+        <TITLE>Spotify Controller</TITLE>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { font-family: sans-serif; padding: 20px; text-align: center; }
+            input[type=text] { width: 100%; padding: 10px; margin: 10px 0; }
+            input[type=submit] { padding: 10px 20px; background: #1DB954; color: white; border: none; border-radius: 5px; cursor: pointer; }
+            .step { margin-bottom: 20px; text-align: left; background: #f0f0f0; padding: 15px; border-radius: 8px; }
+        </style>
     </HEAD>
     <BODY>
         <CENTER>
-            <B>Hello World.... </B>
-            <a href="https://accounts.spotify.com/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=user-modify-playback-state user-read-currently-playing user-read-playback-state user-library-modify user-library-read">Log in to spotify</a>
+            <H2>Spotify Setup</H2>
+            
+            <div class="step">
+                <b>Step 1:</b><br>
+                Click the link below. Log in to Spotify. <br>
+                <i>Note: The page will fail to load (localhost refused/broken). This is expected!</i>
+                <br><br>
+                <a href="https://accounts.spotify.com/authorize?response_type=code&client_id=)=====";
+
+// Note: Between Part 1 and Part 2, we will inject the Client ID, Redirect URI, etc.
+
+const char mainPagePart2[] PROGMEM = R"=====(
+&scope=user-modify-playback-state user-read-currently-playing user-read-playback-state user-library-modify user-library-read" target="_blank">1. Log in to Spotify</a>
+            </div>
+
+            <div class="step">
+                <b>Step 2:</b><br>
+                Look at your browser's address bar on the broken page.<br>
+                Copy the code after <b>?code=</b>
+            </div>
+
+            <div class="step">
+                <b>Step 3:</b><br>
+                Paste the code below and click Submit:
+                <form action="/callback" method="get">
+                    <input type="text" name="code" placeholder="Paste code here...">
+                    <br>
+                    <input type="submit" value="Submit Code">
+                </form>
+            </div>
         </CENTER>
     </BODY>
 </HTML>
 )=====";
 
-// HTML for error page
 const char errorPage[] PROGMEM = R"=====(
 <HTML>
     <HEAD>
-        <TITLE>My first web page</TITLE>
+        <TITLE>Error</TITLE>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
     </HEAD>
     <BODY>
         <CENTER>
-            <B>Hello World.... </B>
-            <a href="https://accounts.spotify.com/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=user-modify-playback-state user-read-currently-playing user-read-playback-state user-library-modify user-library-read">Log in to spotify</a>
+            <H2>Error</H2>
+            <p>Code invalid or missing.</p>
+            <a href="/">Go Back</a>
         </CENTER>
     </BODY>
 </HTML>
@@ -818,24 +833,35 @@ const char errorPage[] PROGMEM = R"=====(
 
 void handleRoot() { // handless HTTP main server for spotify auth
     Serial.println("handling root");
-    char page[500];
-    sprintf(page,mainPage,CLIENT_ID,REDIRECT_URI);
-    server.send(200, "text/html", String(page)+"\r\n"); //Send web page
+    
+    // Chunked sending to save memory
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", ""); // Send headers only
+    
+    // Send Part 1
+    server.sendContent_P(mainPagePart1);
+    
+    // Send Dynamic Link Parts
+    server.sendContent(CLIENT_ID);
+    server.sendContent("&redirect_uri=");
+    server.sendContent(REDIRECT_URI);
+    
+    // Send Part 2
+    server.sendContent_P(mainPagePart2);
+    
+    // Terminate the chunked connection
+    server.sendContent("");
 }
 
 void handleCallbackPage() { // handless call back page but it can also act as root for auth
     if(!spotifyConnection.accessTokenSet){
         if (server.arg("code") == ""){     //Parameter not found
-            char page[500];
-            sprintf(page,errorPage,CLIENT_ID,REDIRECT_URI);
-            server.send(200, "text/html", String(page)); //Send web page
+            server.send(200, "text/html", errorPage); // Send error web page directly from PROGMEM
         }else{     //Parameter found
             if(spotifyConnection.getUserCode(server.arg("code"))){ // send auth complete web page
                 server.send(200,"text/html","Spotify setup complete Auth refresh in :"+String(spotifyConnection.tokenExpireTime));
             }else{
-                char page[500];
-                sprintf(page,errorPage,CLIENT_ID,REDIRECT_URI);
-                server.send(200, "text/html", String(page)); //Send error web page
+                server.send(200, "text/html", errorPage); // Send error web page directly from PROGMEM
             }
         }
     }else{
@@ -880,7 +906,7 @@ void netMenu(){
     bool f = false;
     LCDm.showNets(numNets, selected);
     while(!f){
-        q = true
+        q = true; // Fixed missing semicolon
         while(!selectedSet and !q){
             if(call){
                 switch (pinCalled){
@@ -890,7 +916,7 @@ void netMenu(){
                         break;
                     case 1:
                         selectedSet = true;
-                        LCDm.netMenu(selected);
+                        LCDm.netMenu(selected, 0); // Fixed argument count (need mode)
                         break;
                     case 2:
                         selected = (selected == numNets - 1) ? 0 : selected + 1;
@@ -939,10 +965,17 @@ void manageWifiConnection(){ // manages all wifi connection setup to be able to 
 unsigned long lastNTPUpdate = 0;
 const unsigned long NTP_UPDATE_INTERVAL = 600000; // 10 minutes 
 
+// Helper function to debug time
+void printTime() {
+    Serial.println(timeClient.getFormattedTime());
+}
+
 void updateRTCTime() {
   // Update the RTC with the NTP time
   timeClient.update();
-  setTime(timeClient.getEpochTime());
+  
+  // Removed setTime(...) as we aren't using TimeLib.
+  // We just rely on timeClient to hold the correct time.
 
   Serial.print("NTP Time: ");
   printTime();
@@ -952,7 +985,7 @@ void updateRTCTime() {
 void setup(){
   Serial.begin(115200);
 
-  lcd.init();    // initialize the lcd                   
+  lcd.init();    // initialize the lcd                  
   lcd.backlight();
   // load in the custom chars
   lcd.createChar(0, pause);
@@ -970,9 +1003,7 @@ void setup(){
 
   lcd.setCursor(0, 3);
   lcd.print("connecting to WiFi");
-  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
-    Serial.println("STA Failed to configure");
-  }
+  // REMOVED WiFi.config to allow DHCP (Dynamic IP)
   
   WiFi.begin(WIFI_SSID, PASSWORD); // connect to wifi
   int attempt = 0;
@@ -990,16 +1021,17 @@ void setup(){
   lcd.print("connected to WiFi   ");
   Serial.println("Connected to WiFi\n Ip is: ");
   Serial.println(WiFi.localIP());
-  REDIRECT_URI = "http://" + WiFi.localIP().toString() + "/callback";
+  // The redirect URI is now fixed to localhost, so we don't need to append IP here
+  // REDIRECT_URI = "http://127.0.0.1:8000/callback"; 
   delay(500);
   timeClient.begin(); // initialize the time client
-  updateRTCTime()
+  updateRTCTime(); // Fixed missing semicolon
   lcd.setCursor(0, 3);
   lcd.print("connected to NTP    ");
 
-  server.on("/", handleRoot);                      //Which routine to handle at root location
+  server.on("/", handleRoot);                  //Which routine to handle at root location
   server.on("/callback", handleCallbackPage);      //Which routine to handle at root location
-  server.begin();                                  //Start server
+  server.begin();                              //Start server
   Serial.println("HTTP server started");           // loging
   lcd.setCursor(0, 3);
   lcd.print("HTTPS server Started");
@@ -1017,7 +1049,7 @@ void setup(){
 
 }
 
-int mode = 0;
+// int mode = 0; // Mode global variable conflicts with local arguments, better to keep it managed
 
 void loop(){  // main loop
 
