@@ -7,11 +7,12 @@
 #include <ESP8266WiFi.h> 
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
-// HTTPS Server removed (standard HTTP is sufficient for this approach)
 #include <WiFiClientSecureBearSSL.h>
 #include <WiFiUdp.h>
 #include <NTPClient.h>
 #include <time.h> 
+// ADDED: EEPROM library for storage
+#include <EEPROM.h>
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -24,11 +25,9 @@ char PASSWORD[] = "LaSolucion233@";
 #define CLIENT_ID "7dbaacd4aa4d4f668e6782175ef4e4b4"
 #define CLIENT_SECRET "32ad905e011046e59976f91aaf5ba254"
 
-// FIXED: Using Loopback address with port 8000 as requested.
-// This allows the ESP IP to change without breaking Spotify Auth.
 String REDIRECT_URI = "http://127.0.0.1:8000/callback";
 
-#define codeVersion "1.2.0"
+#define codeVersion "1.2.3"
 #define EEPROM_SIZE 4095
 
 #if defined(ARDUINO) && ARDUINO >= 100
@@ -46,54 +45,16 @@ uint8_t endL[8] = {0x00,0x02,0x0A,0x1E,0x0A,0x02,0x00,0x00};
 uint8_t point[8] = {0x00,0x00,0x0E,0x1F,0x0E,0x00,0x00,0x00};
 uint8_t starter[8] = {0x00,0x08,0x08,0x0F,0x08,0x08,0x00,0x00};
 
-// REMOVED: Static IP configuration. Now uses DHCP.
-  
 LiquidCrystal_I2C lcd(0x3F,20,4);  
 
-String getValue(HTTPClient &http, String key) {
-  bool found = false, look = false, seek = true;
-  int ind = 0;
-  String ret_str = "";
+// --- ADDED: Storage Structure ---
+struct SpotifyData {
+  char refreshToken[512]; // Buffer for the long refresh token
+  unsigned long timestamp; // Network time
+  uint8_t magic; // Verification byte (0x42)
+};
 
-  int len = http.getSize();
-  char char_buff[1];
-  WiFiClient * stream = http.getStreamPtr();
-  while (http.connected() && (len > 0 || len == -1)) {
-    size_t size = stream->available();
-    if (size) {
-      int c = stream->readBytes(char_buff, ((size > sizeof(char_buff)) ? sizeof(char_buff) : size));
-      if (found) {
-        if (seek && char_buff[0] != ':') {
-          continue;
-        } else if(char_buff[0] != '\n'){
-            if(seek && char_buff[0] == ':'){
-                seek = false;
-                int c = stream->readBytes(char_buff, 1);
-            }else{
-                ret_str += char_buff[0];
-            }
-        }else{
-            break;
-        }
-      }
-      else if ((!look) && (char_buff[0] == key[0])) {
-        look = true;
-        ind = 1;
-      } else if (look && (char_buff[0] == key[ind])) {
-        ind ++;
-        if (ind == key.length()) found = true;
-      } else if (look && (char_buff[0] != key[ind])) {
-        ind = 0;
-        look = false;
-      }
-    }
-  }
-
-  if(ret_str.length() > 0 && *(ret_str.end()-1) == ','){
-    ret_str = ret_str.substring(0,ret_str.length()-1);
-  }
-  return ret_str;
-}
+// REMOVED: Broken getValue function
 
 //http response struct
 struct httpResponse{
@@ -116,12 +77,13 @@ class SpotConn {
 public:
     SpotConn(){
         client = std::make_unique<BearSSL::WiFiClientSecure>();
-        client->setInsecure(); // Secure Client for OUTGOING requests to Spotify
-        // FIXED: Increased buffer size to fix error -5 (Connection Lost) during handshake
-        // RX needs to be larger to receive the TLS certificate chain
+        client->setInsecure(); 
         client->setBufferSizes(4096, 1024);
     }
     
+    // UPDATED: Made public for storage access
+    String refreshToken; 
+
     bool getUserCode(String serverCode) {
         https.begin(*client,"https://accounts.spotify.com/api/token");
         String auth = "Basic " + base64::encode(String(CLIENT_ID) + ":" + String(CLIENT_SECRET));
@@ -150,6 +112,9 @@ public:
         return accessTokenSet;
     }
     bool refreshAuth(){
+        // Ensure we have a token to refresh
+        if (refreshToken == "") return false;
+
         https.begin(*client,"https://accounts.spotify.com/api/token");
         String auth = "Basic " + base64::encode(String(CLIENT_ID) + ":" + String(CLIENT_SECRET));
         https.addHeader("Authorization",auth);
@@ -164,13 +129,16 @@ public:
             DynamicJsonDocument doc(1024);
             deserializeJson(doc, response);
             accessToken = String((const char*)doc["access_token"]);
-            // refreshToken = doc["refresh_token"];
+            // Note: Sometimes spotify returns a NEW refresh token, sometimes not.
+            if (doc.containsKey("refresh_token")) {
+               refreshToken = String((const char*)doc["refresh_token"]);
+            }
             tokenExpireTime = doc["expires_in"];
             tokenStartTime = millis();
             accessTokenSet = true;
-            Serial.println(accessToken);
-            Serial.println(refreshToken);
+            Serial.println("Token Refreshed Successfully");
         }else{
+            Serial.println("Refresh Failed:");
             Serial.println(https.getString());
         }
         // Disconnect from the Spotify API
@@ -213,43 +181,61 @@ public:
         https.addHeader("Authorization",auth);
         int httpResponseCode = https.GET();
         bool success = false;
-        String songId = "";
-        bool refresh = false;
-        // Check if the request was successful
+        
         if (httpResponseCode == 200) {
-                        
-            String currentSongProgress = getValue(https,"progress_ms");
-            currentSongPositionMs = currentSongProgress.toFloat();
-            
-            String albumName = getValue(https,"name");
-            String artistName = getValue(https,"name");
-            String songDuration = getValue(https,"duration_ms");
-            currentSong.durationMs = songDuration.toInt();
-            String songName = getValue(https,"name");
-            songId = getValue(https,"uri");
-            String isPlay = getValue(https, "is_playing");
-            isPlaying = isPlay == "true";
-            Serial.println(isPlay);
-            
-            if (songId.length() > 15) {
-               songId = songId.substring(15,songId.length()-1); // Basic check to avoid crash
+            // FIXED: Use ArduinoJson filter to grab specific fields from stream
+            // This is safer and more reliable than manual string parsing
+            StaticJsonDocument<512> filter;
+            filter["progress_ms"] = true;
+            filter["is_playing"] = true;
+            filter["item"]["name"] = true;
+            filter["item"]["duration_ms"] = true;
+            filter["item"]["uri"] = true;
+            filter["item"]["album"]["name"] = true;
+            filter["item"]["artists"][0]["name"] = true;
+
+            // Allocate 4KB for the JSON document on heap
+            DynamicJsonDocument doc(4096);
+            DeserializationError error = deserializeJson(doc, https.getStream(), DeserializationOption::Filter(filter));
+
+            if (!error) {
+                currentSongPositionMs = doc["progress_ms"];
+                currentSong.durationMs = doc["item"]["duration_ms"];
+                currentSong.song = doc["item"]["name"].as<String>();
+                currentSong.album = doc["item"]["album"]["name"].as<String>();
+                currentSong.artist = doc["item"]["artists"][0]["name"].as<String>();
+                
+                String songUri = doc["item"]["uri"].as<String>();
+                // Convert spotify:track:ID to just ID
+                if (songUri.length() > 14) {
+                    currentSong.Id = songUri.substring(14);
+                } else {
+                    currentSong.Id = songUri;
+                }
+
+                isPlaying = doc["is_playing"];
+                Serial.print("Play State: "); Serial.println(isPlaying);
+                Serial.print("Duration: "); Serial.println(currentSong.durationMs);
+                
+                // End first request before starting second
+                https.end();
+
+                // Fetch liked status
+                if (currentSong.Id.length() > 0) {
+                    currentSong.isLiked = findLikedStatus(currentSong.Id);
+                }
+                success = true;
+            } else {
+                Serial.print("deserializeJson() failed: ");
+                Serial.println(error.c_str());
+                https.end();
             }
-            
-            https.end();
-            
-            if (albumName.length() > 2) currentSong.album = albumName.substring(1,albumName.length()-1);
-            if (artistName.length() > 2) currentSong.artist = artistName.substring(1,artistName.length()-1);
-            if (songName.length() > 2) currentSong.song = songName.substring(1,songName.length()-1);
-            currentSong.Id = songId;
-            currentSong.isLiked = findLikedStatus(songId);
-            success = true;
         } else {
             Serial.print("Error getting track info: ");
             Serial.println(httpResponseCode);
             https.end();
         }
         
-        // Disconnect from the Spotify API
         if(success){
             lastSongPositionMs = currentSongPositionMs;
         }
@@ -443,12 +429,11 @@ public:
     std::unique_ptr<BearSSL::WiFiClientSecure> client;
     HTTPClient https;
     String accessToken;
-    String refreshToken;
+    // refreshToken moved to public
 };
 
 
 WiFiUDP ntpUDP;
-// FIXED: Reverted to Standard Web Server (Port 80)
 ESP8266WebServer server(80);
 
 SpotConn spotifyConnection;
@@ -684,8 +669,9 @@ public:
     lcd.print(ti);
 
     // shows song name
+    String displayName = spotifyConnection.currentSong.song + "- ("+spotifyConnection.currentSong.artist+")";
     lcd.setCursor(0,1);
-    int nameLen = spotifyConnection.currentSong.song.length();
+    int nameLen = displayName.length();
     if(lastSong != spotifyConnection.currentSong.song){
       if(nameLen > 20){
         scrolable = true;
@@ -695,28 +681,46 @@ public:
       }
       lastSong = spotifyConnection.currentSong.song;
     }
-
     //scrolling
-    String displayName = spotifyConnection.currentSong.song + "-("+spotifyConnection.currentSong.artist+")";
+    
     if(scrolable){
       lcd.print(displayName.substring(nameScroll, nameScroll+20));
       int steps = int((millis()-LastUpdate)/1500);
       if(nameScroll + 20 == nameLen){nameScroll = 0;}else if(nameScroll + 20 + steps <= nameLen){nameScroll += steps;}else{nameScroll++;}
       LastUpdate = millis();
     }else{
-      lcd.print(spotifyConnection.currentSong.song);
+      lcd.print(displayName);
     }
 
     //progress bar
     lcd.setCursor(0, 2);
-    float progress = float(spotifyConnection.currentSongPositionMs)/float(spotifyConnection.currentSong.durationMs);
-    Serial.println(spotifyConnection.currentSongPositionMs);
-    Serial.println(spotifyConnection.currentSong.durationMs);
-    Serial.println(progress);
-    int bars = floor(progress*18)-1;
-    Serial.println(bars);
+    
+    // FIXED: Division by Zero check
+    // If duration is 0 (parsing error or stopped), we must avoid calculation
+    float progress = 0.0;
+    int bars = 0;
+    
+    if (spotifyConnection.currentSong.durationMs > 0) {
+        progress = float(spotifyConnection.currentSongPositionMs)/float(spotifyConnection.currentSong.durationMs);
+        bars = floor(progress*18)-1;
+    } else {
+        // Fallback for when data is missing
+        progress = 0;
+        bars = 0;
+    }
+
+    //Serial.println(spotifyConnection.currentSongPositionMs);
+    //Serial.println(spotifyConnection.currentSong.durationMs);
+    //Serial.println(progress);
+    //Serial.println(bars);
+    
     bool l_finisher = (int(round(progress*36))%2==1)? true : false;
     lcd.printByte(2);
+    
+    // Safety clamp for bars to avoid loop overflow
+    if (bars > 16) bars = 16;
+    if (bars < 0) bars = -1;
+
     for(int i = 0; i <= bars; i ++){
       lcd.printByte(7);
     }
@@ -763,9 +767,7 @@ bool serverOn = true;
 LCDmanager LCDm;
 
 //web pages
-// FIXED: HTML now split into PROGMEM chunks to avoid giant stack allocation or snprintf buffer overflows.
-// This is the "Chunked Send" method which is extremely memory efficient on ESP8266.
-
+// FIXED: Updated HTML to provide instructions and a Paste Box for the Manual Loopback method
 const char mainPagePart1[] PROGMEM = R"=====(
 <HTML>
     <HEAD>
@@ -856,7 +858,9 @@ void handleRoot() { // handless HTTP main server for spotify auth
 void handleCallbackPage() { // handless call back page but it can also act as root for auth
     if(!spotifyConnection.accessTokenSet){
         if (server.arg("code") == ""){     //Parameter not found
-            server.send(200, "text/html", errorPage); // Send error web page directly from PROGMEM
+            char page[500];
+            snprintf_P(page, 500, errorPage);
+            server.send(200, "text/html", String(page)); //Send web page
         }else{     //Parameter found
             if(spotifyConnection.getUserCode(server.arg("code"))){ // send auth complete web page
                 server.send(200,"text/html","Spotify setup complete Auth refresh in :"+String(spotifyConnection.tokenExpireTime));
@@ -982,8 +986,38 @@ void updateRTCTime() {
   Serial.println();
 }
 
+// --- ADDED: Helper functions for storage ---
+void saveCredentials() {
+  if (spotifyConnection.refreshToken.length() > 0 && spotifyConnection.refreshToken.length() < 512) {
+    SpotifyData data;
+    memset(&data, 0, sizeof(SpotifyData));
+    spotifyConnection.refreshToken.toCharArray(data.refreshToken, 512);
+    data.timestamp = timeClient.getEpochTime();
+    data.magic = 0x42;
+    
+    // Write struct
+    EEPROM.put(0, data);
+    EEPROM.commit();
+    Serial.println("Data saved to EEPROM");
+  }
+}
+
+bool loadCredentials() {
+  SpotifyData data;
+  EEPROM.get(0, data);
+  if (data.magic == 0x42) {
+    Serial.println("Found valid credentials in EEPROM");
+    spotifyConnection.refreshToken = String(data.refreshToken);
+    // Seed time if NTP hasn't updated yet (optional)
+    return true;
+  }
+  return false;
+}
+
 void setup(){
   Serial.begin(115200);
+  // ADDED: Initialize EEPROM
+  EEPROM.begin(1024);
 
   lcd.init();    // initialize the lcd                  
   lcd.backlight();
@@ -1029,12 +1063,35 @@ void setup(){
   lcd.setCursor(0, 3);
   lcd.print("connected to NTP    ");
 
-  server.on("/", handleRoot);                  //Which routine to handle at root location
-  server.on("/callback", handleCallbackPage);      //Which routine to handle at root location
-  server.begin();                              //Start server
-  Serial.println("HTTP server started");           // loging
-  lcd.setCursor(0, 3);
-  lcd.print("HTTPS server Started");
+  // --- ADDED: Check storage logic on startup ---
+  bool credentialsLoaded = loadCredentials();
+  
+  if (credentialsLoaded) {
+      Serial.println("Attempting to refresh token using stored credentials...");
+      if (spotifyConnection.refreshAuth()) {
+          Serial.println("Refresh successful!");
+          serverOn = false; // Skip setup server
+          LCDm.drawMusic();
+      } else {
+          Serial.println("Refresh failed. Starting setup server.");
+          serverOn = true;
+          LCDm.drawSpotifyConection();
+      }
+  } else {
+      Serial.println("No credentials found. Starting setup server.");
+      serverOn = true;
+      LCDm.drawSpotifyConection();
+  }
+
+  // Only start server if needed
+  if (serverOn) {
+      server.on("/", handleRoot);                  //Which routine to handle at root location
+      server.on("/callback", handleCallbackPage);      //Which routine to handle at root location
+      server.begin();                              //Start server
+      Serial.println("HTTP server started");           // loging
+      lcd.setCursor(0, 3);
+      lcd.print("HTTPS server Started");
+  }
 
   for(int i = 0; i < 4; i ++){ // set pin modes and attach interrupts
     pinMode(buttonPins[i], INPUT);
@@ -1042,14 +1099,18 @@ void setup(){
   }
 
   delay(250);
-  lcd.setCursor(0, 3);
-  lcd.print("Start sequence DONE "); // finish message
-  delay(500);
-  LCDm.drawSpotifyConection(); // wait for spotify auth
+  if (!serverOn) {
+      // If we skipped setup, just show "Ready" briefly
+      lcd.setCursor(0, 3);
+      lcd.print("Start sequence DONE "); 
+      delay(500);
+  }
 
 }
 
 // int mode = 0; // Mode global variable conflicts with local arguments, better to keep it managed
+
+// REMOVED: lastStorageSave variable
 
 void loop(){  // main loop
 
@@ -1058,10 +1119,14 @@ void loop(){  // main loop
     lastNTPUpdate = millis();
   }
 
+  // REMOVED: Periodic save block
+
   if(spotifyConnection.accessTokenSet){
     if(serverOn){ // close server 
         server.close();
         serverOn = false;
+        // Save immediately after successful first setup
+        saveCredentials();
     }
 
     // check if spotify auth token needs to be refreshed
@@ -1069,6 +1134,8 @@ void loop(){  // main loop
         Serial.println("refreshing token");
         if(spotifyConnection.refreshAuth()){
             Serial.println("refreshed token");
+            // Save new refresh token if it changed
+            saveCredentials();
         }
     }
 
@@ -1097,13 +1164,15 @@ void loop(){  // main loop
       }
       call = false;
     }
-    Serial.println(analogRead(int(A0)));
+    //Serial.println(analogRead(int(A0)));
     int volRequest = map(analogRead(A0),0,1023,0,100);
     if(abs(volRequest - spotifyConnection.currVol) > 2){
         spotifyConnection.adjustVolume(volRequest);
     } 
     timeLoop = millis();
   }else{
-      server.handleClient();
+      if (serverOn) {
+          server.handleClient();
+      }
   }
 }
