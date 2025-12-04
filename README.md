@@ -6,7 +6,7 @@
 - skip/go back
 - like song
 - display song name, progress and duration
-- IT SHOWS YOU THE TIME
+- IT SHOWS YOU THE TIME (sometimes...)
 
 ## how to make the code work (legacy)
 The procces to make this work for your own projects is quite long but worth it at the end, just follow this steps and you will have the code ready in no time:
