@@ -11,8 +11,8 @@
 #include <WiFiUdp.h>
 #include <NTPClient.h>
 #include <time.h> 
-// ADDED: EEPROM library for storage
 #include <EEPROM.h>
+#include <AsyncHTTPRequest_Generic.h>
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -78,11 +78,240 @@ public:
     SpotConn(){
         client = std::make_unique<BearSSL::WiFiClientSecure>();
         client->setInsecure(); 
-        client->setBufferSizes(4096, 1024);
+        client->setBufferSizes(8192, 1024); // Increased buffer for better SSL handling
+
+        // Initialize async requests with optimal settings for ESP8266
+        trackInfoRequest.setDebug(false);
+        trackInfoRequest.setTimeout(15); // Longer timeout for SSL handshake
+        
+        likedStatusRequest.setDebug(false);
+        likedStatusRequest.setTimeout(10); 
+        
+        // Don't set callbacks here - need to wait until spotifyConnection exists
+    }
+
+    // Initialize callbacks after spotifyConnection is created
+    void initializeCallbacks() {
+        trackInfoRequest.onReadyStateChange(trackInfoCallback);
+        likedStatusRequest.onReadyStateChange(likedStatusCallback);
     }
 
     String refreshToken; 
     
+    // Async state management
+    unsigned long lastTrackInfoRequest = 0;
+    unsigned long lastLikedStatusRequest = 0;
+    const unsigned long TRACK_INFO_INTERVAL = 2000;
+    bool trackInfoReady = true;
+    bool likedStatusReady = true;
+    String pendingSongId = "";
+    int asyncFailureCount = 0;
+    bool useAsyncRequests = true;
+
+    void update() {
+        unsigned long currentTime = millis();
+        
+        // Check WiFi connection health for async requests
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("⚠ WiFi disconnected, waiting for reconnection...");
+            return;
+        }
+        
+        // Send track info request if ready and time has passed
+        if (accessTokenSet && trackInfoReady && (currentTime - lastTrackInfoRequest >= TRACK_INFO_INTERVAL)) {
+            if (useAsyncRequests) {
+                sendTrackInfoRequest();
+            } else {
+                getTrackInfoSync();
+            }
+        }
+        
+        // Send liked status request if ready and song ID pending (only if async is working)
+        if (useAsyncRequests && likedStatusReady && pendingSongId.length() > 0) {
+            sendLikedStatusRequest();
+        }
+    }
+
+    void sendTrackInfoRequest() {
+        if (!trackInfoReady) return;
+        
+        // Ensure request is properly reset before reuse
+        if (trackInfoRequest.readyState() != 0) {
+            Serial.println("Resetting trackInfoRequest");
+            // Give it a moment to clean up
+            yield();
+        }
+        
+        String url = "https://api.spotify.com/v1/me/player/currently-playing";
+        
+        Serial.print("Opening async request to: ");
+        Serial.println(url);
+        
+        bool opened = trackInfoRequest.open("GET", url.c_str());
+        if (opened) {
+            String auth = "Bearer " + accessToken;
+            trackInfoRequest.setReqHeader("Authorization", auth.c_str());
+            trackInfoRequest.setReqHeader("User-Agent", "ESP8266-SpotifyController/1.3");
+            trackInfoRequest.setReqHeader("Accept", "application/json");
+            trackInfoRequest.setReqHeader("Cache-Control", "no-cache");
+            
+            if (trackInfoRequest.send()) {
+                trackInfoReady = false;
+                lastTrackInfoRequest = millis();
+                Serial.println("✓ Track info request sent successfully");
+            } else {
+                Serial.println("✗ Failed to send track info request");
+                asyncFailureCount++;
+                trackInfoReady = true; // Reset for retry
+            }
+        } else {
+            asyncFailureCount++;
+            Serial.print("✗ Failed to open track info request (failure #");
+            Serial.print(asyncFailureCount);
+            Serial.println(")");
+            
+            if (asyncFailureCount >= 5) {
+                Serial.println("⚠ Too many async failures, switching to sync mode");
+                useAsyncRequests = false;
+                getTrackInfoSync();
+            } else {
+                Serial.println("Retrying in next cycle...");
+                trackInfoReady = true; // Allow retry
+            }
+        }
+    }
+
+    void sendLikedStatusRequest() {
+        if (!likedStatusReady || pendingSongId.length() == 0) return;
+        
+        String songId = pendingSongId; // Save before clearing
+        pendingSongId = ""; // Clear pending ID immediately
+        
+        // Ensure request is properly reset before reuse
+        if (likedStatusRequest.readyState() != 0) {
+            Serial.println("Resetting likedStatusRequest");
+            yield();
+        }
+        
+        String url = "https://api.spotify.com/v1/me/tracks/contains?ids=" + songId;
+        
+        Serial.print("Opening liked status request for song: ");
+        Serial.println(songId);
+        
+        bool opened = likedStatusRequest.open("GET", url.c_str());
+        if (opened) {
+            String auth = "Bearer " + accessToken;
+            likedStatusRequest.setReqHeader("Authorization", auth.c_str());
+            likedStatusRequest.setReqHeader("Content-Type", "application/json");
+            likedStatusRequest.setReqHeader("User-Agent", "ESP8266-SpotifyController/1.3");
+            likedStatusRequest.setReqHeader("Cache-Control", "no-cache");
+            
+            if (likedStatusRequest.send()) {
+                likedStatusReady = false;
+                lastLikedStatusRequest = millis();
+                Serial.println("✓ Liked status request sent successfully");
+            } else {
+                Serial.println("✗ Failed to send liked status request");
+                likedStatusReady = true; // Reset for next attempt
+            }
+        } else {
+            Serial.println("✗ Failed to open liked status request - skipping");
+            likedStatusReady = true; // Reset for next attempt
+        }
+    }
+
+    // Synchronous fallback method for when async fails
+    void getTrackInfoSync() {
+        if (!accessTokenSet) return;
+        
+        Serial.println("Using sync track info request");
+        String url = "https://api.spotify.com/v1/me/player/currently-playing";
+        https.setTimeout(3000);
+        https.begin(*client, url);
+        String auth = "Bearer " + accessToken;
+        https.addHeader("Authorization", auth);
+        https.addHeader("User-Agent", "ESP8266-SpotifyController");
+        
+        int httpResponseCode = https.GET();
+        
+        if (httpResponseCode == 200) {
+            String response = https.getString();
+            processTrackInfoJson(response);
+            Serial.println("Sync track info updated");
+        } else if (httpResponseCode == 204) {
+            Serial.println("Nothing playing (sync)");
+        } else {
+            Serial.print("Sync track info error: ");
+            Serial.println(httpResponseCode);
+        }
+        
+        https.end();
+        trackInfoReady = true;
+        lastTrackInfoRequest = millis();
+        lastUpdateTimeStamp = millis();
+    }
+
+    // Method to reset async system and try again
+    void resetAsyncSystem() {
+        Serial.println("🔄 Resetting async system...");
+        asyncFailureCount = 0;
+        useAsyncRequests = true;
+        trackInfoReady = true;
+        likedStatusReady = true;
+        pendingSongId = "";
+        
+        // Reinitialize the requests
+        trackInfoRequest.setTimeout(15);
+        likedStatusRequest.setTimeout(10);
+        
+        Serial.println("✓ Async system reset complete");
+    }
+
+    // Static callback functions - forward declarations only
+    static void trackInfoCallback(void* optParm, AsyncHTTPRequest* request, int readyState);
+    static void likedStatusCallback(void* optParm, AsyncHTTPRequest* request, int readyState);
+
+    void processTrackInfoJson(const String& jsonString) {
+        JsonDocument filter;
+        filter["progress_ms"] = true;
+        filter["is_playing"] = true;
+        filter["item"]["name"] = true;
+        filter["item"]["duration_ms"] = true;
+        filter["item"]["uri"] = true;
+        filter["item"]["album"]["name"] = true;
+        filter["item"]["artists"][0]["name"] = true;
+
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, jsonString, DeserializationOption::Filter(filter));
+
+        if (!error) {
+            currentSongPositionMs = doc["progress_ms"];
+            currentSong.durationMs = doc["item"]["duration_ms"];
+            currentSong.song = doc["item"]["name"].as<String>();
+            currentSong.album = doc["item"]["album"]["name"].as<String>();
+            currentSong.artist = doc["item"]["artists"][0]["name"].as<String>();
+            
+            String songUri = doc["item"]["uri"].as<String>();
+            if (songUri.length() > 14) {
+                currentSong.Id = songUri.substring(14);
+            } else {
+                currentSong.Id = songUri;
+            }
+
+            isPlaying = doc["is_playing"];
+            
+            // Queue liked status check if song changed
+            if (currentSong.Id.length() > 0 && currentSong.Id != currentSong.Id) {
+                pendingSongId = currentSong.Id;
+            }
+            
+            lastSongPositionMs = currentSongPositionMs;
+        } else {
+            Serial.print("JSON parse error: ");
+            Serial.println(error.c_str());
+        }
+    }
+
     bool getUserCode(String serverCode) {
         https.begin(*client,"https://accounts.spotify.com/api/token");
         String auth = "Basic " + base64::encode(String(CLIENT_ID) + ":" + String(CLIENT_SECRET));
@@ -94,7 +323,7 @@ public:
         // Check if the request was successful
         if (httpResponseCode == HTTP_CODE_OK) {
             String response = https.getString();
-            DynamicJsonDocument doc(1024);
+            JsonDocument doc;
             deserializeJson(doc, response);
             accessToken = String((const char*)doc["access_token"]);
             refreshToken = String((const char*)doc["refresh_token"]);
@@ -125,11 +354,11 @@ public:
         // Check if the request was successful
         if (httpResponseCode == HTTP_CODE_OK) {
             String response = https.getString();
-            DynamicJsonDocument doc(1024);
+            JsonDocument doc;
             deserializeJson(doc, response);
             accessToken = String((const char*)doc["access_token"]);
             // Note: Sometimes spotify returns a NEW refresh token, sometimes not.
-            if (doc.containsKey("refresh_token")) {
+            if (doc["refresh_token"].is<const char*>()) {
                refreshToken = String((const char*)doc["refresh_token"]);
             }
             tokenExpireTime = doc["expires_in"];
@@ -169,10 +398,11 @@ public:
         
         // Disconnect from the Spotify API
         https.end();
-        getTrackInfo();
+        update();
         return success;
     }
 
+    /*
     bool getTrackInfo(){
         long startTime = millis();
         String url = "https://api.spotify.com/v1/me/player/currently-playing";
@@ -183,9 +413,6 @@ public:
 
         int httpResponseCode = https.GET();
         bool success = false;
-        Serial.print("Get Track Info request Time: ");
-        Serial.println(millis() - startTime);
-        startTime = millis();
 
         if (httpResponseCode == 200) {
             StaticJsonDocument<512> filter;
@@ -199,15 +426,7 @@ public:
 
             DynamicJsonDocument doc(4096);
 
-            String jsonString = https.getString();
-
-            Serial.print("Get Track stream Time: ");
-            Serial.println(millis() - startTime);
-            startTime = millis();
-            DeserializationError error = deserializeJson(doc, jsonString, DeserializationOption::Filter(filter));
-
-            Serial.print("Deserialize Info Time: ");
-            Serial.println(millis() - startTime);
+            DeserializationError error = deserializeJson(doc, https.getStream(), DeserializationOption::Filter(filter));
 
             if (!error) {
                 currentSongPositionMs = doc["progress_ms"];
@@ -225,7 +444,6 @@ public:
                 }
 
                 isPlaying = doc["is_playing"];                
-                // End first request before starting second
                 https.end();
 
                 // Fetch liked status
@@ -274,6 +492,8 @@ public:
 
         return success;
     }
+    */
+
     bool toggleLiked(String songId){
         String url = "https://api.spotify.com/v1/me/tracks/contains?ids="+songId;
         https.begin(*client,url);
@@ -354,7 +574,7 @@ public:
 
         // Disconnect from the Spotify API
         https.end();
-        getTrackInfo();
+        update();
         return success;
     }
     bool skipBack(){
@@ -377,7 +597,7 @@ public:
 
         // Disconnect from the Spotify API
         https.end();
-        getTrackInfo();
+        update();
         return success;
     }
     bool likeSong(String songId){
@@ -441,6 +661,9 @@ public:
     std::unique_ptr<BearSSL::WiFiClientSecure> client;
     HTTPClient https;
     String accessToken;
+
+    AsyncHTTPRequest trackInfoRequest;
+    AsyncHTTPRequest likedStatusRequest;
 };
 
 
@@ -449,6 +672,79 @@ ESP8266WebServer server(80);
 
 SpotConn spotifyConnection;
 NTPClient timeClient(ntpUDP, "ar.pool.ntp.org", -10800, 60000); // NTP client
+
+// Implementation of async callback functions
+void SpotConn::trackInfoCallback(void* optParm, AsyncHTTPRequest* request, int readyState) {
+    if (readyState == readyStateDone) {
+        spotifyConnection.trackInfoReady = true;
+        int httpCode = request->responseHTTPcode();
+        
+        Serial.print("Track info callback - HTTP ");
+        Serial.print(httpCode);
+        Serial.print(" - ");
+        
+        if (httpCode == 200) {
+            String response = request->responseText();
+            if (response.length() > 0) {
+                spotifyConnection.processTrackInfoJson(response);
+                Serial.println("✓ Track info updated successfully");
+                // Reset failure count on success
+                spotifyConnection.asyncFailureCount = 0;
+                if (!spotifyConnection.useAsyncRequests) {
+                    Serial.println("✓ Async working again, re-enabling");
+                    spotifyConnection.useAsyncRequests = true;
+                }
+            } else {
+                Serial.println("✗ Empty response received");
+            }
+        } else if (httpCode == 204) {
+            Serial.println("✓ Nothing playing");
+            // Reset failure count on success (even if no content)
+            spotifyConnection.asyncFailureCount = 0;
+            if (!spotifyConnection.useAsyncRequests) {
+                Serial.println("✓ Async working again, re-enabling");
+                spotifyConnection.useAsyncRequests = true;
+            }
+        } else if (httpCode == 401) {
+            Serial.println("✗ Unauthorized - token may be expired");
+        } else if (httpCode == -1) {
+            Serial.println("✗ Connection failed");
+            spotifyConnection.asyncFailureCount++;
+        } else {
+            Serial.print("✗ Error code: ");
+            Serial.println(httpCode);
+            if (httpCode < 0) spotifyConnection.asyncFailureCount++;
+        }
+        
+        spotifyConnection.lastUpdateTimeStamp = millis();
+    }
+}
+
+void SpotConn::likedStatusCallback(void* optParm, AsyncHTTPRequest* request, int readyState) {
+    if (readyState == readyStateDone) {
+        spotifyConnection.likedStatusReady = true;
+        int httpCode = request->responseHTTPcode();
+        
+        Serial.print("Liked status callback - HTTP ");
+        Serial.print(httpCode);
+        Serial.print(" - ");
+        
+        if (httpCode == 200) {
+            String response = request->responseText();
+            response.trim();
+            spotifyConnection.currentSong.isLiked = (response == "[ true ]");
+            Serial.print("✓ Liked status: ");
+            Serial.println(spotifyConnection.currentSong.isLiked ? "♥ LIKED" : "♡ not liked");
+        } else if (httpCode == 401) {
+            Serial.println("✗ Unauthorized - token may be expired");
+        } else if (httpCode == -1) {
+            Serial.println("✗ Connection failed");
+        } else {
+            Serial.print("✗ Error code: ");
+            Serial.println(httpCode);
+        }
+    }
+}
 
 String printEncryptionType(int thisType) {
   // read the encryption type and print out the name:
@@ -897,7 +1193,7 @@ void handleCallbackPage() { // handless call back page but it can also act as ro
 // pin manager, its called whenever a button is pressed(DO NOT TOUCH UNLES YOU KNOW WHAT UR DOING)
 volatile int pinCalled;
 volatile bool call = false;
-void ICACHE_RAM_ATTR pinManager(){
+void IRAM_ATTR pinManager(){
   call = true;
   for(int i = 0; i < 5; i ++){
     int reading = digitalRead(buttonPins[i]);
@@ -1068,9 +1364,8 @@ void setup(){
 
   lcd.setCursor(0, 3);
   lcd.print("connecting to WiFi");
-  // REMOVED WiFi.config to allow DHCP (Dynamic IP)
   
-  WiFi.begin(WIFI_SSID, PASSWORD); // connect to wifi
+  WiFi.begin(WIFI_SSID, PASSWORD); 
   int attempt = 0;
 
   while (WiFi.status() != WL_CONNECTED) {
@@ -1086,15 +1381,24 @@ void setup(){
   lcd.print("connected to WiFi   ");
   Serial.println("Connected to WiFi\n Ip is: ");
   Serial.println(WiFi.localIP());
-  // The redirect URI is now fixed to localhost, so we don't need to append IP here
-  // REDIRECT_URI = "http://127.0.0.1:8000/callback"; 
+
   delay(500);
-  timeClient.begin(); // initialize the time client
-  updateRTCTime(); // Fixed missing semicolon
+  timeClient.begin(); 
+  updateRTCTime(); 
   lcd.setCursor(0, 3);
   lcd.print("connected to NTP    ");
 
-  // --- ADDED: Check storage logic on startup ---
+  // Initialize async callbacks after spotifyConnection exists
+  spotifyConnection.initializeCallbacks();
+  
+  Serial.println("🚀 Async HTTP system initialized");
+  Serial.print("📡 WiFi signal strength: ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+  Serial.print("🌐 Free heap: ");
+  Serial.print(ESP.getFreeHeap());
+  Serial.println(" bytes");
+
   bool credentialsLoaded = loadCredentials();
   
   if (credentialsLoaded) {
@@ -1143,7 +1447,7 @@ void setup(){
 
 void loop(){  // main loop
 
-  if (millis() - lastNTPUpdate >= NTP_UPDATE_INTERVAL) { // update RTC time every X minutes
+  if (millis() - lastNTPUpdate >= NTP_UPDATE_INTERVAL) { 
     updateRTCTime();
     lastNTPUpdate = millis();
   }
@@ -1157,48 +1461,44 @@ void loop(){  // main loop
     }
 
     // check if spotify auth token needs to be refreshed
-    if((millis() - spotifyConnection.tokenStartTime)/1000 > spotifyConnection.tokenExpireTime){
+    if((millis() - spotifyConnection.tokenStartTime)/1000 > (unsigned long)spotifyConnection.tokenExpireTime){
         Serial.println("refreshing token");
         if(spotifyConnection.refreshAuth()){
             Serial.println("refreshed token");
-            // Save new refresh token if it changed
             saveCredentials();
         }
     }
 
-    spotifyConnection.getTrackInfo(); // gets current playing from spotify
+    spotifyConnection.update(); // gets current playing from spotify
 
-    LCDm.drawMusic(); // update LCD display with current song info
-
-    if(spotifyConnection.currentSong.song == NULL){ // nothing playing
-      LCDm.waitForDevice(); 
-    }
+    //update display
+    static unsigned long lastDisplayUpdate = 0;
+        if (millis() - lastDisplayUpdate >= 250) {
+            if(spotifyConnection.currentSong.song.length() > 0){
+                LCDm.drawMusic();
+            } else {
+                LCDm.waitForDevice(); 
+            }
+            lastDisplayUpdate = millis();
+        }
 
     if(call){ // manage user interactions
       switch (pinCalled){
-        case 0:
-            spotifyConnection.skipBack();
-            break;
-        case 1:
-            spotifyConnection.togglePlay();
-            break;
-        case 2:
-            spotifyConnection.skipForward();
-            break;
-        case 3:
-            spotifyConnection.toggleLiked(spotifyConnection.currentSong.Id); // need to change this to cofig menu
-            break;
-        default:
-            break;
+        case 0: spotifyConnection.skipBack(); break;
+        case 1: spotifyConnection.togglePlay(); break;
+        case 2: spotifyConnection.skipForward(); break;
+        case 3: spotifyConnection.toggleLiked(spotifyConnection.currentSong.Id);  break;
       }
       call = false;
     }
-    int volRequest = map(analogRead(A0),0,1023,0,100);
-    if(abs(volRequest - spotifyConnection.currVol) > 2){
+
+    // handle volume adjustment
+    int volRequest = map(analogRead(A0), 0, 1023, 0, 100);
+    if (abs(volRequest - spotifyConnection.currVol) > 2) {
         spotifyConnection.adjustVolume(volRequest);
     } 
     timeLoop = millis();
-  }else{
+  } else {
       if (serverOn) {
           server.handleClient();
       }
