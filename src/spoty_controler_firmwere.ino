@@ -27,7 +27,7 @@ char PASSWORD[] = "LaSolucion233@";
 
 String REDIRECT_URI = "http://127.0.0.1:8000/callback";
 
-#define codeVersion "1.2.3"
+#define codeVersion "1.3"
 #define EEPROM_SIZE 4095
 
 #if defined(ARDUINO) && ARDUINO >= 100
@@ -80,10 +80,9 @@ public:
         client->setInsecure(); 
         client->setBufferSizes(4096, 1024);
     }
-    
-    // UPDATED: Made public for storage access
-    String refreshToken; 
 
+    String refreshToken; 
+    
     bool getUserCode(String serverCode) {
         https.begin(*client,"https://accounts.spotify.com/api/token");
         String auth = "Basic " + base64::encode(String(CLIENT_ID) + ":" + String(CLIENT_SECRET));
@@ -173,18 +172,22 @@ public:
         getTrackInfo();
         return success;
     }
+
     bool getTrackInfo(){
+        long startTime = millis();
         String url = "https://api.spotify.com/v1/me/player/currently-playing";
         https.useHTTP10(true);
         https.begin(*client,url);
         String auth = "Bearer " + String(accessToken);
         https.addHeader("Authorization",auth);
+
         int httpResponseCode = https.GET();
         bool success = false;
-        
+        Serial.print("Get Track Info request Time: ");
+        Serial.println(millis() - startTime);
+        startTime = millis();
+
         if (httpResponseCode == 200) {
-            // FIXED: Use ArduinoJson filter to grab specific fields from stream
-            // This is safer and more reliable than manual string parsing
             StaticJsonDocument<512> filter;
             filter["progress_ms"] = true;
             filter["is_playing"] = true;
@@ -194,9 +197,17 @@ public:
             filter["item"]["album"]["name"] = true;
             filter["item"]["artists"][0]["name"] = true;
 
-            // Allocate 4KB for the JSON document on heap
             DynamicJsonDocument doc(4096);
-            DeserializationError error = deserializeJson(doc, https.getStream(), DeserializationOption::Filter(filter));
+
+            String jsonString = https.getString();
+
+            Serial.print("Get Track stream Time: ");
+            Serial.println(millis() - startTime);
+            startTime = millis();
+            DeserializationError error = deserializeJson(doc, jsonString, DeserializationOption::Filter(filter));
+
+            Serial.print("Deserialize Info Time: ");
+            Serial.println(millis() - startTime);
 
             if (!error) {
                 currentSongPositionMs = doc["progress_ms"];
@@ -213,10 +224,7 @@ public:
                     currentSong.Id = songUri;
                 }
 
-                isPlaying = doc["is_playing"];
-                Serial.print("Play State: "); Serial.println(isPlaying);
-                Serial.print("Duration: "); Serial.println(currentSong.durationMs);
-                
+                isPlaying = doc["is_playing"];                
                 // End first request before starting second
                 https.end();
 
@@ -239,8 +247,10 @@ public:
         if(success){
             lastSongPositionMs = currentSongPositionMs;
         }
+        lastUpdateTimeStamp = millis();
         return success;
     }
+
     bool findLikedStatus(String songId){
         String url = "https://api.spotify.com/v1/me/tracks/contains?ids="+songId;
         https.begin(*client,url);
@@ -425,11 +435,12 @@ public:
     float lastSongPositionMs;
     int currVol;
     bool isPlaying = false;
+    unsigned long lastUpdateTimeStamp; 
+
   private:
     std::unique_ptr<BearSSL::WiFiClientSecure> client;
     HTTPClient https;
     String accessToken;
-    // refreshToken moved to public
 };
 
 
@@ -462,6 +473,12 @@ String printEncryptionType(int thisType) {
       break;
   }
 }
+
+  /*
+      ------------------------------------------------------
+      LCD manager class for handling the graphical interface
+      ------------------------------------------------------
+  */
 
 class LCDmanager { // the one responsable for managing all graphical intefrace
 public:
@@ -659,6 +676,10 @@ public:
   void drawMusic(){ // draws the main music screen
 
     lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("vol: ");
+    lcd.print(spotifyConnection.currVol);
+    lcd.print("%");
     lcd.setCursor(15, 0);
     timeClient.update(); // shows the time
     
@@ -957,13 +978,14 @@ void netMenu(){
                 call = false;
             }
         }
+        yield();
     }
 }
+
 void manageWifiConnection(){ // manages all wifi connection setup to be able to connect to any network type 
     //wifi selection mode
     netMenu();
     
-
 }
 
 unsigned long lastNTPUpdate = 0;
@@ -999,6 +1021,8 @@ void saveCredentials() {
     EEPROM.put(0, data);
     EEPROM.commit();
     Serial.println("Data saved to EEPROM");
+    Serial.print("data length: ");
+    Serial.println(sizeof(data));
   }
 }
 
@@ -1013,6 +1037,13 @@ bool loadCredentials() {
   }
   return false;
 }
+
+
+/*
+-----------------------------------------------  
+----------------- Setup -----------------------
+-----------------------------------------------
+*/
 
 void setup(){
   Serial.begin(115200);
@@ -1110,16 +1141,12 @@ void setup(){
 
 // int mode = 0; // Mode global variable conflicts with local arguments, better to keep it managed
 
-// REMOVED: lastStorageSave variable
-
 void loop(){  // main loop
 
   if (millis() - lastNTPUpdate >= NTP_UPDATE_INTERVAL) { // update RTC time every X minutes
     updateRTCTime();
     lastNTPUpdate = millis();
   }
-
-  // REMOVED: Periodic save block
 
   if(spotifyConnection.accessTokenSet){
     if(serverOn){ // close server 
@@ -1139,9 +1166,11 @@ void loop(){  // main loop
         }
     }
 
-    if(spotifyConnection.getTrackInfo()){ // gets current playing from spotify
-      LCDm.drawMusic();
-    }else if(spotifyConnection.currentSong.song == NULL){ // nothing playing
+    spotifyConnection.getTrackInfo(); // gets current playing from spotify
+
+    LCDm.drawMusic(); // update LCD display with current song info
+
+    if(spotifyConnection.currentSong.song == NULL){ // nothing playing
       LCDm.waitForDevice(); 
     }
 
@@ -1164,7 +1193,6 @@ void loop(){  // main loop
       }
       call = false;
     }
-    //Serial.println(analogRead(int(A0)));
     int volRequest = map(analogRead(A0),0,1023,0,100);
     if(abs(volRequest - spotifyConnection.currVol) > 2){
         spotifyConnection.adjustVolume(volRequest);
@@ -1175,4 +1203,5 @@ void loop(){  // main loop
           server.handleClient();
       }
   }
+  yield();
 }
