@@ -54,24 +54,6 @@ struct SpotifyData {
   uint8_t magic; // Verification byte (0x42)
 };
 
-// WiFi Network Storage Structure
-#define MAX_NETWORKS 5
-#define SSID_MAX_LENGTH 32
-#define PASSWORD_MAX_LENGTH 64
-
-struct WiFiNetwork {
-  char ssid[SSID_MAX_LENGTH + 1];
-  char password[PASSWORD_MAX_LENGTH + 1];
-  uint8_t encryptionType;
-  bool isValid; // Flag to check if this slot contains valid data
-};
-
-struct WiFiNetworkData {
-  WiFiNetwork networks[MAX_NETWORKS];
-  uint8_t networkCount;
-  uint8_t magic; // Verification byte (0xAB)
-};
-
 // REMOVED: Broken getValue function
 
 //http response struct
@@ -1221,9 +1203,9 @@ volatile int pinCalled;
 volatile bool call = false;
 void IRAM_ATTR pinManager(){
   call = true;
-  for(int i = 0; i < 4; i ++){  // Fixed: Changed from 5 to 4 since we only have 4 buttons
+  for(int i = 0; i < 5; i ++){
     int reading = digitalRead(buttonPins[i]);
-    if(reading == true){  
+    if(reading == true && i != 4){  
       switch (i){
       case 0:
           pinCalled = 0;
@@ -1245,527 +1227,69 @@ void IRAM_ATTR pinManager(){
   }
 }
 
-// Global variables for keyboard input
-String inputBuffer = "";
-int cursorPos = 0;
-char currentChar = 'A';
-bool isWriting = false;
-
-// Character set for keyboard input
-const String charSet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 !@#$%^&*()_+-=[]{}|;:,.<>?";
-int charSetIndex = 0;
-
-// Button polling function for menus (bypasses interrupts)
-int pollButtons() {
-  static unsigned long lastButtonTime = 0;
-  static int lastButtonPressed = -1;
-  static unsigned long debounceDelay = 200; // 200ms debounce
-  
-  unsigned long currentTime = millis();
-  
-  // Check if enough time has passed since last button press
-  if (currentTime - lastButtonTime < debounceDelay) {
-    return -1; // Still in debounce period
-  }
-  
-  // Check each button
-  for (int i = 0; i < 4; i++) {
-    if (digitalRead(buttonPins[i]) == HIGH) {
-      if (lastButtonPressed != i) { // Only trigger on new button press
-        lastButtonPressed = i;
-        lastButtonTime = currentTime;
-        Serial.print("Button pressed: ");
-        Serial.println(i);
-        return i;
-      }
-      return -1; // Same button still held
-    }
-  }
-  
-  // No buttons pressed
-  lastButtonPressed = -1;
-  return -1;
-}
-
-// Wait for any button press (blocking)
-int waitForButtonPress() {
-  while (true) {
-    int button = pollButtons();
-    if (button != -1) {
-      return button;
-    }
-    yield();
-    delay(10);
-  }
-}
-
-void resetKeyboardInput() {
-  inputBuffer = "";
-  cursorPos = 0;
-  currentChar = 'A';
-  isWriting = false;
-  charSetIndex = 0;
-}
-
-char getNextChar(char current, int direction) {
-  int currentIndex = charSet.indexOf(current);
-  if (currentIndex == -1) currentIndex = 0;
-  
-  currentIndex += direction;
-  if (currentIndex >= charSet.length()) currentIndex = 0;
-  if (currentIndex < 0) currentIndex = charSet.length() - 1;
-  
-  return charSet.charAt(currentIndex);
-}
-
-bool connectToNetwork(int networkIndex, const String& password = "") {
-  String ssid = WiFi.SSID(networkIndex);
-  uint8_t encType = WiFi.encryptionType(networkIndex);
-  
-  LCDm.clearScreen();
-  LCDm.LCDdraw(0, 0, "Connecting to:");
-  LCDm.LCDdraw(0, 1, ssid);
-  LCDm.LCDdraw(0, 2, "Please wait...");
-  
-  if (encType == ENC_TYPE_NONE) {
-    WiFi.begin(ssid.c_str());
-  } else {
-    WiFi.begin(ssid.c_str(), password.c_str());
-  }
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    LCDm.LCDdraw(15, 2, String(attempts/2) + "s");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("Connected to: " + ssid);
-    
-    // Save credentials if connection successful and password was provided
-    if (password.length() > 0 || encType == ENC_TYPE_NONE) {
-      addNetworkCredential(ssid, password, encType);
-    }
-    
-    LCDm.LCDdraw(0, 2, "Connected!        ");
-    LCDm.LCDdraw(0, 3, WiFi.localIP().toString());
-    delay(2000);
-    return true;
-  } else {
-    LCDm.LCDdraw(0, 2, "Connection failed!");
-    delay(2000);
-    return false;
-  }
-}
-
-bool handlePasswordInput(int networkIndex) {
-  String ssid = WiFi.SSID(networkIndex);
-  resetKeyboardInput();
-  
-  LCDm.drawKeyboard("Enter Password:", inputBuffer, currentChar, cursorPos, isWriting);
-  
-  while (true) {
-    int buttonPressed = pollButtons();
-    
-    if (buttonPressed != -1) {
-      switch (buttonPressed) {
-        case 0: // Up/Previous char
-          if (isWriting) {
-            currentChar = getNextChar(currentChar, -1);
-            charSetIndex = charSet.indexOf(currentChar);
-          } else {
-            if (cursorPos > 0) cursorPos--;
-            if (cursorPos < (int)inputBuffer.length()) {
-              currentChar = inputBuffer.charAt(cursorPos);
-            } else {
-              currentChar = 'A';
-            }
-          }
-          LCDm.drawKeyboard("Enter Password:", inputBuffer, currentChar, cursorPos, isWriting);
-          break;
-          
-        case 1: // Toggle write mode / Select
-          if (isWriting) {
-            // Commit character
-            if (cursorPos >= (int)inputBuffer.length()) {
-              inputBuffer += currentChar;
-            } else {
-              inputBuffer.setCharAt(cursorPos, currentChar);
-            }
-            isWriting = false;
-            if (cursorPos < 19) cursorPos++;
-          } else {
-            isWriting = true;
-            if (cursorPos < (int)inputBuffer.length()) {
-              currentChar = inputBuffer.charAt(cursorPos);
-            } else {
-              currentChar = 'A';
-            }
-          }
-          LCDm.drawKeyboard("Enter Password:", inputBuffer, currentChar, cursorPos, isWriting);
-          break;
-          
-        case 2: // Down/Next char or move cursor
-          if (isWriting) {
-            currentChar = getNextChar(currentChar, 1);
-            charSetIndex = charSet.indexOf(currentChar);
-          } else {
-            if (cursorPos < 19) cursorPos++;
-            if (cursorPos < (int)inputBuffer.length()) {
-              currentChar = inputBuffer.charAt(cursorPos);
-            } else {
-              currentChar = 'A';
-            }
-          }
-          LCDm.drawKeyboard("Enter Password:", inputBuffer, currentChar, cursorPos, isWriting);
-          break;
-          
-        case 3: // Back/Submit
-          if (isWriting) {
-            isWriting = false;
-          } else if (inputBuffer.length() == 0) {
-            return false; // Cancel
-          } else {
-            // Submit password
-            return connectToNetwork(networkIndex, inputBuffer);
-          }
-          LCDm.drawKeyboard("Enter Password:", inputBuffer, currentChar, cursorPos, isWriting);
-          break;
-      }
-    }
-    yield();
-    delay(10);
-  }
-}
-
-bool handleNetworkMenu(int networkIndex) {
-  String ssid = WiFi.SSID(networkIndex);
-  uint8_t encType = WiFi.encryptionType(networkIndex);
-  int mode = 0;
-  int maxModes;
-  
-  // Determine max modes based on encryption type
-  switch (encType) {
-    case ENC_TYPE_NONE:
-      maxModes = 2; // connect, RSSI
-      break;
-    case ENC_TYPE_WEP:
-      maxModes = 4; // connect, RSSI, Key Index, Password
-      break;
-    default: // WPA/WPA2/Auto
-      maxModes = 3; // connect, RSSI, password
-      break;
-  }
-  
-  LCDm.netMenu(networkIndex, mode);
-  
-  while (true) {
-    int buttonPressed = pollButtons();
-    
-    if (buttonPressed != -1) {
-      switch (buttonPressed) {
-        case 0: // Previous option
-          mode = (mode == 0) ? maxModes - 1 : mode - 1;
-          LCDm.netMenu(networkIndex, mode);
-          break;
-          
-        case 1: // Select option
-          switch (mode) {
-            case 0: // Connect
-              if (encType == ENC_TYPE_NONE) {
-                return connectToNetwork(networkIndex);
-              } else {
-                // Check if we have stored password
-                String storedPassword = getNetworkPassword(ssid);
-                if (storedPassword.length() > 0) {
-                  LCDm.clearScreen();
-                  LCDm.LCDdraw(0, 0, "Use stored password?");
-                  LCDm.LCDdraw(0, 1, "Yes (Enter) No (Back)");
-                  
-                  bool waitingForAnswer = true;
-                  while (waitingForAnswer) {
-                    int btn = pollButtons();
-                    if (btn != -1) {
-                      if (btn == 1) { // Use stored password
-                        waitingForAnswer = false;
-                        return connectToNetwork(networkIndex, storedPassword);
-                      } else if (btn == 3) { // Enter new password
-                        waitingForAnswer = false;
-                        return handlePasswordInput(networkIndex);
-                      }
-                    }
-                    yield();
-                    delay(10);
-                  }
-                } else {
-                  return handlePasswordInput(networkIndex);
+void netMenu(){
+    int numNets = WiFi.scanNetworks();
+    int selected = 0;
+    bool selectedSet = false;
+    bool q = false;
+    bool f = false;
+    LCDm.showNets(numNets, selected);
+    while(!f){
+        q = true; // Fixed missing semicolon
+        while(!selectedSet and !q){
+            if(call){
+                switch (pinCalled){
+                    case 0:
+                        selected = (selected == 0) ? numNets - 1 : selected - 1;
+                        LCDm.showNets(numNets, selected);
+                        break;
+                    case 1:
+                        selectedSet = true;
+                        LCDm.netMenu(selected, 0); // Fixed argument count (need mode)
+                        break;
+                    case 2:
+                        selected = (selected == numNets - 1) ? 0 : selected + 1;
+                        LCDm.showNets(numNets, selected);
+                        break;
+                    case 3:
+                        q = true;
+                        break;
+                    default:
+                        break;
                 }
-              }
-              break;
-              
-            case 1: // RSSI - just show and return to menu
-              LCDm.clearScreen();
-              LCDm.LCDdraw(0, 0, ssid);
-              LCDm.LCDdraw(0, 1, "Signal: " + String(WiFi.RSSI(networkIndex)) + " dBm");
-              LCDm.LCDdraw(0, 3, "            Press Back");
-              
-              waitForButtonPress();
-              LCDm.netMenu(networkIndex, mode);
-              break;
-              
-            case 2: // Password entry (for WPA/WEP)
-              return handlePasswordInput(networkIndex);
-              break;
-          }
-          break;
-          
-        case 2: // Next option
-          mode = (mode == maxModes - 1) ? 0 : mode + 1;
-          LCDm.netMenu(networkIndex, mode);
-          break;
-          
-        case 3: // Back to network list
-          return false;
-          break;
-      }
-    }
-    yield();
-    delay(10);
-  }
-}
-
-bool netMenu() {
-  Serial.println("Starting network menu");
-  
-  int numNets = WiFi.scanNetworks();
-  if (numNets == 0) {
-    LCDm.clearScreen();
-    LCDm.LCDdraw(0, 0, "No networks found");
-    LCDm.LCDdraw(0, 1, "Press any button");
-    LCDm.LCDdraw(0, 2, "to try again");
-    
-    waitForButtonPress();
-    return false;
-  }
-  
-  Serial.print("Found ");
-  Serial.print(numNets);
-  Serial.println(" networks");
-  
-  int selected = 0;
-  LCDm.showNets(numNets, selected);
-  
-  while (true) {
-    int buttonPressed = pollButtons();
-    
-    if (buttonPressed != -1) {
-      Serial.print("Network menu button: ");
-      Serial.println(buttonPressed);
-      
-      switch (buttonPressed) {
-        case 0: // Previous network
-          selected = (selected == 0) ? numNets - 1 : selected - 1;
-          LCDm.showNets(numNets, selected);
-          Serial.print("Selected network: ");
-          Serial.println(selected);
-          break;
-          
-        case 1: // Select network
-          Serial.println("Entering network submenu");
-          if (handleNetworkMenu(selected)) {
-            return true; // Connected successfully
-          }
-          // Return to network list
-          LCDm.showNets(numNets, selected);
-          break;
-          
-        case 2: // Next network
-          selected = (selected == numNets - 1) ? 0 : selected + 1;
-          LCDm.showNets(numNets, selected);
-          Serial.print("Selected network: ");
-          Serial.println(selected);
-          break;
-          
-        case 3: // Exit network menu
-          Serial.println("Exiting network menu");
-          return false;
-          break;
-      }
-    }
-    yield();
-    delay(10);
-  }
-}
-
-void showStoredNetworksMenu() {
-  WiFiNetworkData data;
-  if (!loadNetworkCredentials(data) || data.networkCount == 0) {
-    LCDm.clearScreen();
-    LCDm.LCDdraw(0, 0, "No stored networks");
-    LCDm.LCDdraw(0, 2, "Press Back to exit");
-    
-    waitForButtonPress();
-    return;
-  }
-  
-  // Create array of valid network indices
-  int validNetworks[MAX_NETWORKS];
-  int validCount = 0;
-  
-  for (int i = 0; i < MAX_NETWORKS; i++) {
-    if (data.networks[i].isValid) {
-      validNetworks[validCount] = i;
-      validCount++;
-    }
-  }
-  
-  int selected = 0;
-  
-  while (true) {
-    // Display current stored network
-    LCDm.clearScreen();
-    LCDm.LCDdraw(0, 0, "Stored Networks (" + String(validCount) + ")");
-    
-    if (validCount > 0) {
-      int networkIndex = validNetworks[selected];
-      LCDm.LCDdraw(0, 1, String(data.networks[networkIndex].ssid));
-      LCDm.LCDdraw(0, 2, "Delete (Enter)");
-      LCDm.LCDdraw(0, 3, "<  " + String(selected + 1) + "/" + String(validCount) + "  > Back");
-    }
-    
-    int buttonPressed = pollButtons();
-    
-    if (buttonPressed != -1) {
-      switch (buttonPressed) {
-        case 0: // Previous
-          if (validCount > 0) {
-            selected = (selected == 0) ? validCount - 1 : selected - 1;
-          }
-          break;
-          
-        case 1: // Delete network
-          if (validCount > 0) {
-            int networkIndex = validNetworks[selected];
-            String ssidToDelete = String(data.networks[networkIndex].ssid);
-            
-            LCDm.clearScreen();
-            LCDm.LCDdraw(0, 0, "Delete network?");
-            LCDm.LCDdraw(0, 1, ssidToDelete);
-            LCDm.LCDdraw(0, 2, "Yes (Enter) No (Back)");
-            
-            bool waitingForConfirm = true;
-            while (waitingForConfirm) {
-              int btn = pollButtons();
-              if (btn != -1) {
-                if (btn == 1) { // Confirm delete
-                  removeNetworkCredential(ssidToDelete);
-                  waitingForConfirm = false;
-                  
-                  // Refresh the list
-                  loadNetworkCredentials(data);
-                  validCount = 0;
-                  for (int i = 0; i < MAX_NETWORKS; i++) {
-                    if (data.networks[i].isValid) {
-                      validNetworks[validCount] = i;
-                      validCount++;
-                    }
-                  }
-                  
-                  if (selected >= validCount) selected = validCount - 1;
-                  if (selected < 0) selected = 0;
-                  
-                } else if (btn == 3) { // Cancel
-                  waitingForConfirm = false;
-                }
-              }
-              yield();
-              delay(10);
+                call = false;
             }
-          }
-          break;
-          
-        case 2: // Next
-          if (validCount > 0) {
-            selected = (selected == validCount - 1) ? 0 : selected + 1;
-          }
-          break;
-          
-        case 3: // Back
-          return;
-      }
-    }
-    yield();
-    delay(10);
-  }
-}
-
-void manageWifiConnection() { // manages all wifi connection setup to be able to connect to any network type 
-    Serial.println("Entering WiFi management");
-    
-    int menuOption = 0;
-    const int maxOptions = 2;
-    const String menuOptions[] = {"Scan for networks", "Manage stored networks"};
-    
-    while (true) {
-        LCDm.clearScreen();
-        LCDm.LCDdraw(0, 0, "WiFi Management");
-        LCDm.LCDdraw(0, 1, ">" + menuOptions[menuOption]);
-        
-        if (menuOption + 1 < maxOptions) {
-            LCDm.LCDdraw(0, 2, " " + menuOptions[menuOption + 1]);
         }
-        
-        LCDm.LCDdraw(0, 3, "Enter=Select Back=Exit");
-        
-        int buttonPressed = pollButtons();
-        
-        if (buttonPressed != -1) {
-            Serial.print("WiFi menu button: ");
-            Serial.println(buttonPressed);
-            
-            switch (buttonPressed) {
-                case 0: // Previous option
-                    menuOption = (menuOption == 0) ? maxOptions - 1 : menuOption - 1;
-                    break;
-                    
-                case 1: // Select option
-                    switch (menuOption) {
-                        case 0: // Scan for networks
-                            {
-                                Serial.println("Starting network scan");
-                                bool connected = netMenu();
-                                if (connected) {
-                                    LCDm.clearScreen();
-                                    LCDm.LCDdraw(0, 0, "Connected!");
-                                    LCDm.LCDdraw(0, 1, WiFi.localIP().toString());
-                                    LCDm.LCDdraw(0, 3, "Press any button");
-                                    
-                                    waitForButtonPress();
-                                    return; // Exit WiFi management
-                                }
-                            }
-                            break;
-                            
-                        case 1: // Manage stored networks
-                            Serial.println("Managing stored networks");
-                            showStoredNetworksMenu();
-                            break;
-                    }
-                    break;
-                    
-                case 2: // Next option
-                    menuOption = (menuOption == maxOptions - 1) ? 0 : menuOption + 1;
-                    break;
-                    
-                case 3: // Back/Exit
-                    Serial.println("Exiting WiFi management");
-                    return;
+
+        while(selectedSet){
+            if(call){
+                switch (pinCalled){
+                    case 0:
+                        
+                        break;
+                    case 1:
+                        
+                        break;
+                    case 2:
+                        
+                        break;
+                    case 3:
+                        selectedSet = false;
+                        break;
+                    default:
+                        break;
+                }
+                call = false;
             }
         }
         yield();
-        delay(10);
     }
+}
+
+void manageWifiConnection(){ // manages all wifi connection setup to be able to connect to any network type 
+    //wifi selection mode
+    netMenu();
+    
 }
 
 unsigned long lastNTPUpdate = 0;
@@ -1818,163 +1342,6 @@ bool loadCredentials() {
   return false;
 }
 
-// --- WiFi Network Storage Functions ---
-#define SPOTIFY_DATA_OFFSET 0
-#define WIFI_DATA_OFFSET 600  // Start WiFi data after Spotify data
-
-void saveNetworkCredentials() {
-  WiFiNetworkData data;
-  EEPROM.get(WIFI_DATA_OFFSET, data);
-  
-  // If no valid data exists, initialize empty structure
-  if (data.magic != 0xAB) {
-    memset(&data, 0, sizeof(WiFiNetworkData));
-    data.magic = 0xAB;
-    data.networkCount = 0;
-    for (int i = 0; i < MAX_NETWORKS; i++) {
-      data.networks[i].isValid = false;
-    }
-  }
-  
-  EEPROM.put(WIFI_DATA_OFFSET, data);
-  EEPROM.commit();
-  Serial.print("WiFi networks saved to EEPROM. Count: ");
-  Serial.println(data.networkCount);
-}
-
-bool loadNetworkCredentials(WiFiNetworkData& data) {
-  EEPROM.get(WIFI_DATA_OFFSET, data);
-  if (data.magic == 0xAB) {
-    Serial.print("Found valid network credentials in EEPROM. Count: ");
-    Serial.println(data.networkCount);
-    return true;
-  } else {
-    // Initialize empty structure
-    memset(&data, 0, sizeof(WiFiNetworkData));
-    data.magic = 0xAB;
-    data.networkCount = 0;
-    for (int i = 0; i < MAX_NETWORKS; i++) {
-      data.networks[i].isValid = false;
-    }
-    Serial.println("No network credentials found, initialized empty structure");
-    return false;
-  }
-}
-
-bool addNetworkCredential(const String& ssid, const String& password, uint8_t encType) {
-  WiFiNetworkData data;
-  loadNetworkCredentials(data);
-  
-  // Check if network already exists
-  for (int i = 0; i < MAX_NETWORKS; i++) {
-    if (data.networks[i].isValid && String(data.networks[i].ssid) == ssid) {
-      // Update existing network
-      password.toCharArray(data.networks[i].password, PASSWORD_MAX_LENGTH + 1);
-      data.networks[i].encryptionType = encType;
-      Serial.println("Updated existing network: " + ssid);
-      EEPROM.put(WIFI_DATA_OFFSET, data);
-      EEPROM.commit();
-      return true;
-    }
-  }
-  
-  // Find empty slot for new network
-  for (int i = 0; i < MAX_NETWORKS; i++) {
-    if (!data.networks[i].isValid) {
-      ssid.toCharArray(data.networks[i].ssid, SSID_MAX_LENGTH + 1);
-      password.toCharArray(data.networks[i].password, PASSWORD_MAX_LENGTH + 1);
-      data.networks[i].encryptionType = encType;
-      data.networks[i].isValid = true;
-      data.networkCount++;
-      Serial.println("Added new network: " + ssid);
-      EEPROM.put(WIFI_DATA_OFFSET, data);
-      EEPROM.commit();
-      return true;
-    }
-  }
-  
-  Serial.println("Cannot add network, storage full");
-  return false;
-}
-
-bool removeNetworkCredential(const String& ssid) {
-  WiFiNetworkData data;
-  if (!loadNetworkCredentials(data)) return false;
-  
-  for (int i = 0; i < MAX_NETWORKS; i++) {
-    if (data.networks[i].isValid && String(data.networks[i].ssid) == ssid) {
-      data.networks[i].isValid = false;
-      memset(&data.networks[i], 0, sizeof(WiFiNetwork));
-      data.networkCount--;
-      Serial.println("Removed network: " + ssid);
-      EEPROM.put(WIFI_DATA_OFFSET, data);
-      EEPROM.commit();
-      return true;
-    }
-  }
-  
-  Serial.println("Network not found: " + ssid);
-  return false;
-}
-
-String getNetworkPassword(const String& ssid) {
-  WiFiNetworkData data;
-  if (!loadNetworkCredentials(data)) return "";
-  
-  for (int i = 0; i < MAX_NETWORKS; i++) {
-    if (data.networks[i].isValid && String(data.networks[i].ssid) == ssid) {
-      return String(data.networks[i].password);
-    }
-  }
-  
-  return ""; // Network not found
-}
-
-bool tryConnectToKnownNetworks() {
-  int numNets = WiFi.scanNetworks();
-  if (numNets == 0) {
-    Serial.println("No networks found in scan");
-    return false;
-  }
-  
-  WiFiNetworkData data;
-  if (!loadNetworkCredentials(data) || data.networkCount == 0) {
-    Serial.println("No stored network credentials");
-    return false;
-  }
-  
-  // Try each scanned network against stored credentials
-  for (int i = 0; i < numNets; i++) {
-    String scannedSSID = WiFi.SSID(i);
-    String password = getNetworkPassword(scannedSSID);
-    
-    if (password.length() > 0) {
-      Serial.println("Attempting to connect to known network: " + scannedSSID);
-      
-      WiFi.begin(scannedSSID.c_str(), password.c_str());
-      
-      // Wait up to 15 seconds for connection
-      int attempts = 0;
-      while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        delay(500);
-        attempts++;
-        Serial.print(".");
-      }
-      
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nConnected to: " + scannedSSID);
-        Serial.println("IP: " + WiFi.localIP().toString());
-        return true;
-      } else {
-        Serial.println("\nFailed to connect to: " + scannedSSID);
-        WiFi.disconnect();
-      }
-    }
-  }
-  
-  return false;
-}
-
 
 /*
 -----------------------------------------------  
@@ -1984,8 +1351,8 @@ bool tryConnectToKnownNetworks() {
 
 void setup(){
   Serial.begin(115200);
-  // ADDED: Initialize EEPROM with larger size for WiFi networks
-  EEPROM.begin(2048);
+  // ADDED: Initialize EEPROM
+  EEPROM.begin(1024);
 
   lcd.init();    // initialize the lcd                  
   lcd.backlight();
@@ -2005,62 +1372,22 @@ void setup(){
   lcd.home();
   LCDm.drawStart();
 
-  LCDm.showSetupStatus("Scanning WiFi...");
+  LCDm.showSetupStatus("connecting to WiFi");
   
-  // Try to connect to known networks first
-  bool connectedToKnown = tryConnectToKnownNetworks();
-  
-  if (!connectedToKnown) {
-    LCDm.showSetupStatus("Select WiFi network");
-    delay(1000);
-    
-    // Show network selection menu
-    bool connected = false;
-    while (!connected) {
-      connected = netMenu();
-      if (!connected) {
-        LCDm.clearScreen();
-        LCDm.LCDdraw(0, 0, "Connection failed");
-        LCDm.LCDdraw(0, 1, "Try again?");
-        LCDm.LCDdraw(0, 2, "Yes (Enter) No (Back)");
-        
-        bool waitingForRetry = true;
-        while (waitingForRetry) {
-          int buttonPressed = pollButtons();
-          if (buttonPressed != -1) {
-            if (buttonPressed == 1) { // Try again
-              waitingForRetry = false;
-            } else if (buttonPressed == 3) { // Exit - use hardcoded credentials
-              LCDm.showSetupStatus("Using default WiFi");
-              WiFi.begin(WIFI_SSID, PASSWORD);
-              int attempt = 0;
-              while (WiFi.status() != WL_CONNECTED && attempt < 60) {
-                delay(500);
-                Serial.println("Connecting to default WiFi...");
-                LCDm.LCDdraw(19, 3, String(attempt));
-                attempt++;
-              }
-              connected = (WiFi.status() == WL_CONNECTED);
-              waitingForRetry = false;
-            }
-          }
-          yield();
-          delay(10);
-        }
-      }
-    }
+  WiFi.begin(WIFI_SSID, PASSWORD); 
+  int attempt = 0;
+
+  while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.println("Conecting to WiFi...");
+      LCDm.LCDdraw(19, 3, String(attempt));
+      attempt++;
+
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    LCDm.showSetupStatus("Connected to WiFi");
-    Serial.println("Connected to WiFi");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    LCDm.showSetupStatus("WiFi connection failed!");
-    Serial.println("Failed to connect to any WiFi network");
-    // Continue anyway - might work in AP mode or with ethernet
-  }
+  LCDm.showSetupStatus("connected to WiFi");
+  Serial.println("Connected to WiFi\n Ip is: ");
+  Serial.println(WiFi.localIP());
 
   delay(500);
   timeClient.begin(); 
@@ -2160,36 +1487,6 @@ void loop(){  // main loop
         }
 
     if(call){ // manage user interactions
-      // Check for special button combination to access WiFi settings
-      // Hold buttons 0+3 simultaneously for 3 seconds to access WiFi management
-      static unsigned long buttonHoldStart = 0;
-      static bool holdingButtons = false;
-      
-      // Check if buttons 0 and 3 are being held simultaneously
-      if (digitalRead(buttonPins[0]) == HIGH && digitalRead(buttonPins[3]) == HIGH) {
-        if (!holdingButtons) {
-          holdingButtons = true;
-          buttonHoldStart = millis();
-        } else if (millis() - buttonHoldStart > 3000) {
-          // Access WiFi management after 3 seconds
-          LCDm.clearScreen();
-          LCDm.LCDdraw(0, 0, "Accessing WiFi");
-          LCDm.LCDdraw(0, 1, "Settings...");
-          delay(1000);
-          
-          manageWifiConnection();
-          
-          holdingButtons = false;
-          call = false;
-          
-          // Return to normal display
-          return; // Skip normal button processing
-        }
-      } else {
-        holdingButtons = false;
-      }
-      
-      // Normal button processing
       switch (pinCalled){
         case 0: spotifyConnection.skipBack(); break;
         case 1: spotifyConnection.togglePlay(); break;
