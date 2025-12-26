@@ -27,7 +27,7 @@ char PASSWORD[] = "LaSolucion233@";
 
 String REDIRECT_URI = "http://127.0.0.1:8000/callback";
 
-#define codeVersion "1.3"
+#define codeVersion "1.3.1"
 #define EEPROM_SIZE 4095
 
 #if defined(ARDUINO) && ARDUINO >= 100
@@ -107,10 +107,15 @@ public:
     String pendingSongId = "";
     int asyncFailureCount = 0;
     bool useAsyncRequests = true;
-
+    unsigned long lastUpdate = 0;
     void update() {
+    
         unsigned long currentTime = millis();
-        
+        if(isPlaying){
+          currentSongPositionMs += (currentTime - lastUpdate);
+        }
+        lastUpdate = currentTime;
+
         // Check WiFi connection health for async requests
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("⚠ WiFi disconnected, waiting for reconnection...");
@@ -125,11 +130,11 @@ public:
                 getTrackInfoSync();
             }
         }
-        
+
         // Send liked status request if ready and song ID pending (only if async is working)
         if (useAsyncRequests && likedStatusReady && pendingSongId.length() > 0) {
             sendLikedStatusRequest();
-        }
+        }        
     }
 
     void sendTrackInfoRequest() {
@@ -785,35 +790,127 @@ public:
   String lastSong = "";
   bool scrolable;
 
-  void drawStart(){ // draws the start up page
+  // Screen buffer to track current display content
+  String currentScreen = "";
+  int screenWidth = 20;
+  int screenHeight = 4;
+
+  // Initialize screen with dimensions and clear display
+  void initScreen(int width, int height) {
+    screenWidth = width;
+    screenHeight = height;
+    
+    // Clear physical display
     lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("WIRELESS CONTROLLER"); // project name
-    lcd.setCursor(0, 1);
-    lcd.print(String("version ") + String(codeVersion)); // shows version
-    lcd.setCursor(0, 2);
-    lcd.print("by: Manuel Rao"); // shows author
+    
+    // Initialize screen buffer with spaces
+    currentScreen = "";
+    for (int i = 0; i < screenHeight * screenWidth; i++) {
+      currentScreen += " ";
+    }
+    
+    Serial.print("LCD initialized: ");
+    Serial.print(width);
+    Serial.print("x");
+    Serial.println(height);
+  }
+
+  void LCDdraw(int cursorx, int cursory, String text){ // draws only new text
+    // Boundary checks
+    if (cursory >= screenHeight || cursorx >= screenWidth || cursorx < 0 || cursory < 0) {
+      return; // Out of bounds
+    }
+    
+    // Calculate starting position in screen buffer
+    int startPos = (cursory * screenWidth) + cursorx;
+    
+    // Only process characters that fit on the screen
+    int maxLength = screenWidth - cursorx;
+    if (text.length() > maxLength) {
+      text = text.substring(0, maxLength);
+    }
+    
+    bool needsUpdate = false;
+    String updatedChars = "";
+    
+    // Check each character for changes
+    for (int i = 0; i < text.length(); i++) {
+      int bufferPos = startPos + i;
+      
+      // Safety check for buffer bounds
+      if (bufferPos >= currentScreen.length()) {
+        break;
+      }
+      
+      char newChar = text.charAt(i);
+      char currentChar = currentScreen.charAt(bufferPos);
+      
+      if (newChar != currentChar) {
+        if (!needsUpdate) {
+          // First difference found, set cursor position
+          lcd.setCursor(cursorx + i, cursory);
+          needsUpdate = true;
+        }
+        
+        // Add character to update string
+        updatedChars += newChar;
+        
+        // Update buffer
+        currentScreen.setCharAt(bufferPos, newChar);
+      } else if (needsUpdate) {
+        // We were updating but this char matches, print accumulated changes
+        lcd.print(updatedChars);
+        updatedChars = "";
+        needsUpdate = false;
+      }
+    }
+    
+    // Print any remaining changes
+    if (needsUpdate && updatedChars.length() > 0) {
+      lcd.print(updatedChars);
+    }
+  }
+
+  // Clear a specific line efficiently
+  void clearLine(int line) {
+    if (line >= 0 && line < screenHeight) {
+      String spaces = "";
+      for (int i = 0; i < screenWidth; i++) {
+        spaces += " ";
+      }
+      LCDdraw(0, line, spaces);
+    }
+  }
+
+  // Clear entire screen and reset buffer
+  void clearScreen() {
+    initScreen(screenWidth, screenHeight);
+  }
+
+  void drawStart(){ // draws the start up page
+    // Clear the screen buffer and physical display
+    initScreen(screenWidth, screenHeight);
+    
+    // Use efficient drawing
+    LCDdraw(0, 0, "WIRELESS CONTROLLER"); // project name
+    LCDdraw(0, 1, String("version ") + String(codeVersion)); // shows version
+    LCDdraw(0, 2, "by: Manuel Rao"); // shows author
   }
 
   void drawSpotifyConection(){ // draws the spotify setpu page
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Spotify Setup");
-    lcd.setCursor(0, 1);
-    lcd.print("Connect to IP:");
-    lcd.setCursor(0, 2);
-    lcd.print(WiFi.localIP()); 
-    lcd.setCursor(0, 3);
-    lcd.print("For setup");
+    initScreen(screenWidth, screenHeight);
+    
+    LCDdraw(0, 0, "Spotify Setup");
+    LCDdraw(0, 1, "Connect to IP:");
+    LCDdraw(0, 2, WiFi.localIP().toString()); 
+    LCDdraw(0, 3, "For setup");
   }
 
   void waitForDevice(){ // draws the waiting for device page
-    lcd.clear();
-    lcd.setCursor(15, 0);
+    // Don't clear entire screen, just update what's needed
     timeClient.update();
-    lcd.print(timeClient.getFormattedTime().substring(0,5));
-    lcd.setCursor(0,1);
-    lcd.print("waiting for device");
+    LCDdraw(15, 0, timeClient.getFormattedTime().substring(0,5));
+    LCDdraw(0, 1, "waiting for device  "); // Extra spaces to clear any previous text
   }
 
 
@@ -971,23 +1068,35 @@ public:
 
   void drawMusic(){ // draws the main music screen
 
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("vol: ");
-    lcd.print(spotifyConnection.currVol);
-    lcd.print("%");
-    lcd.setCursor(15, 0);
+    // Volume and time line
+    String volLine = "vol: " + String(spotifyConnection.currVol) + "%";
     timeClient.update(); // shows the time
     
     // UPDATED: Used timeClient.getHours() instead of hour() from TimeLib
     int h = timeClient.getHours();
     int m = timeClient.getMinutes();
     String ti = String((h < 10)? "0"+String(h) : String(h))+":"+String((m < 10)? "0"+String(m) : String(m));
-    lcd.print(ti);
+    
+    // Create complete top line with volume and time
+    String topLine = volLine;
+    // Pad with spaces to position time at column 15
+    while (topLine.length() < 15) {
+      topLine += " ";
+    }
+    topLine += ti;
+    
+    // Ensure top line is exactly 20 characters
+    while (topLine.length() < 20) {
+      topLine += " ";
+    }
+    if (topLine.length() > 20) {
+      topLine = topLine.substring(0, 20);
+    }
+    
+    LCDdraw(0, 0, topLine);
 
     // shows song name
     String displayName = spotifyConnection.currentSong.song + "- ("+spotifyConnection.currentSong.artist+")";
-    lcd.setCursor(0,1);
     int nameLen = displayName.length();
     if(lastSong != spotifyConnection.currentSong.song){
       if(nameLen > 20){
@@ -995,25 +1104,34 @@ public:
         nameScroll = 0;
       }else{
         scrolable = false;
+        for(int i =  0; i < 20 - nameLen; i++){
+          displayName += " ";
+        }
       }
       lastSong = spotifyConnection.currentSong.song;
     }
-    //scrolling
     
+    String songLine = "";
     if(scrolable){
-      lcd.print(displayName.substring(nameScroll, nameScroll+20));
-      int steps = int((millis()-LastUpdate)/1500);
+      songLine = displayName.substring(nameScroll, nameScroll+20);
+      int steps = int((millis()-LastUpdate)/1000);
       if(nameScroll + 20 == nameLen){nameScroll = 0;}else if(nameScroll + 20 + steps <= nameLen){nameScroll += steps;}else{nameScroll++;}
-      LastUpdate = millis();
+      if(steps > 0) LastUpdate = millis();
     }else{
-      lcd.print(displayName);
+      songLine = displayName;
     }
+    
+    // Ensure song line is exactly 20 characters
+    while (songLine.length() < 20) {
+      songLine += " ";
+    }
+    if (songLine.length() > 20) {
+      songLine = songLine.substring(0, 20);
+    }
+    
+    LCDdraw(0, 1, songLine);
 
     //progress bar
-    lcd.setCursor(0, 2);
-    
-    // FIXED: Division by Zero check
-    // If duration is 0 (parsing error or stopped), we must avoid calculation
     float progress = 0.0;
     int bars = 0;
     
@@ -1025,46 +1143,59 @@ public:
         progress = 0;
         bars = 0;
     }
-
-    //Serial.println(spotifyConnection.currentSongPositionMs);
-    //Serial.println(spotifyConnection.currentSong.durationMs);
-    //Serial.println(progress);
-    //Serial.println(bars);
     
     bool l_finisher = (int(round(progress*36))%2==1)? true : false;
-    lcd.printByte(2);
+    String progressLine = "";
+    progressLine += char(2); // starter char
     
     // Safety clamp for bars to avoid loop overflow
     if (bars > 16) bars = 16;
     if (bars < 0) bars = -1;
 
     for(int i = 0; i <= bars; i ++){
-      lcd.printByte(7);
+      progressLine += char(7); // point char
     }
-    lcd.printByte((l_finisher)? 5 : 6);
-    String bar = "";
+    progressLine += char((l_finisher)? 5 : 6); // end char
+    
     for(int i = 0; i < (16 - bars); i ++){
-      bar = bar + "-";
+      progressLine += "-";
     }
-    lcd.print(bar);
-    lcd.printByte(6);
+    progressLine += char(6); // end char
+    
+    // Ensure progress line is exactly 20 characters
+    while (progressLine.length() < 20) {
+      progressLine += " ";
+    }
+    if (progressLine.length() > 20) {
+      progressLine = progressLine.substring(0, 20);
+    }
+    
+    LCDdraw(0, 2, progressLine);
 
     // show progress time and total song length
-    lcd.setCursor(0, 3);
     int progressMinsIn = floor(spotifyConnection.currentSongPositionMs/60000);
     String progressMins = String((progressMinsIn < 10) ? "0" + String(progressMinsIn) : String(progressMinsIn));
     int progressSecIn = floor(spotifyConnection.currentSongPositionMs/1000) - progressMinsIn*60;
     String progressSec = String((progressSecIn < 10) ? "0" + String(progressSecIn) : String(progressSecIn));
-    lcd.print(progressMins + ":" + progressSec + "/");
+    
     int durationMinsIn = floor(spotifyConnection.currentSong.durationMs/60000);
     String durationMins = String((durationMinsIn < 10) ? "0" + String(durationMinsIn) : String(durationMinsIn));
     int durationSecIn = floor(spotifyConnection.currentSong.durationMs/1000) - durationMinsIn*60;
     String durationSec = String((durationSecIn < 10) ? "0" + String(durationSecIn) : String(durationSecIn));
-    lcd.print(durationMins + ":" + durationSec);
-    lcd.print("  < "); //backtrack
-    spotifyConnection.isPlaying ? lcd.printByte(0) : lcd.printByte(1); //pause/play button
-    lcd.print(" > "); //skip button
-    spotifyConnection.currentSong.isLiked ? lcd.printByte(3) : lcd.printByte(4);
+    
+    String timeLine = progressMins + ":" + progressSec + "/" + durationMins + ":" + durationSec;
+
+    while(timeLine.length() < 13){
+      timeLine += " ";
+    }
+    timeLine += "< "; //backtrack
+    timeLine += char(spotifyConnection.isPlaying ? 0 : 1); //pause/play button
+    timeLine += " > "; //skip button
+    timeLine += char(spotifyConnection.currentSong.isLiked ? 3 : 4); // heart
+    
+    
+    
+    LCDdraw(0, 3, timeLine);
   }
 
   int LastUpdate = 0;
@@ -1439,6 +1570,7 @@ void setup(){
       lcd.setCursor(0, 3);
       lcd.print("Start sequence DONE "); 
       delay(500);
+      LCDm.clearScreen();
   }
 
 }
@@ -1496,7 +1628,8 @@ void loop(){  // main loop
     int volRequest = map(analogRead(A0), 0, 1023, 0, 100);
     if (abs(volRequest - spotifyConnection.currVol) > 2) {
         spotifyConnection.adjustVolume(volRequest);
-    } 
+        spotifyConnection.lastTrackInfoRequest += 300; // delay next track info request
+    }
     timeLoop = millis();
   } else {
       if (serverOn) {
